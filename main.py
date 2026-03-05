@@ -24,6 +24,8 @@ async def on_ready() -> None:
 def main() -> None:
     bot.load_extension("cogs.leaderboard")
     bot.load_extension("cogs.announce")
+    bot.load_extension("cogs.active")
+    bot.load_extension("cogs.poll")
     bot.run(BOT_TOKEN)
 
 

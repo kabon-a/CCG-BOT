@@ -2,6 +2,7 @@
 
 import json
 import re
+import time
 import unicodedata
 from dataclasses import dataclass
 from typing import Any
@@ -133,6 +134,45 @@ async def init_db() -> None:
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_leaderboards_guild ON leaderboards(guild_id)
         """)
+
+        # Active users (for @active role, last_activity within 7 days)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS active_users (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                last_activity REAL NOT NULL,
+                PRIMARY KEY (guild_id, user_id)
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_active_users_guild ON active_users(guild_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_active_users_activity ON active_users(last_activity)")
+
+        # Polls (custom polls with reactions, not Discord native)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS polls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                options TEXT NOT NULL,
+                role_ids TEXT NOT NULL,
+                ends_at REAL NOT NULL,
+                created_at REAL NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS poll_votes (
+                poll_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                option_index INTEGER NOT NULL,
+                PRIMARY KEY (poll_id, user_id, option_index),
+                FOREIGN KEY (poll_id) REFERENCES polls(id) ON DELETE CASCADE
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_polls_ends_at ON polls(ends_at)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_polls_guild ON polls(guild_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_poll_votes_poll ON poll_votes(poll_id)")
 
         # Migration: drop old entries table (legacy card-based schema)
         await db.execute("DROP TABLE IF EXISTS entries")
@@ -374,5 +414,154 @@ async def delete_leaderboard(guild_id: int, name: str) -> bool:
         await db.execute("DELETE FROM leaderboards WHERE id = ?", (lb_id,))
         await db.commit()
     return True
+
+
+# --- Active users (for @active role) ---
+
+ACTIVE_WINDOW_SECONDS = 7 * 24 * 60 * 60  # 7 days
+
+
+async def record_activity(guild_id: int, user_id: int) -> None:
+    """Record or update last activity for a user in a guild."""
+    now = time.time()
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        await conn.execute(
+            """
+            INSERT INTO active_users (guild_id, user_id, last_activity) VALUES (?, ?, ?)
+            ON CONFLICT (guild_id, user_id) DO UPDATE SET last_activity = excluded.last_activity
+            """,
+            (guild_id, user_id, now),
+        )
+        await conn.commit()
+
+
+async def get_active_user_ids(guild_id: int) -> set[int]:
+    """Return user IDs with activity within the last 7 days."""
+    cutoff = time.time() - ACTIVE_WINDOW_SECONDS
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        cur = await conn.execute(
+            "SELECT user_id FROM active_users WHERE guild_id = ? AND last_activity >= ?",
+            (guild_id, cutoff),
+        )
+        return {r[0] for r in await cur.fetchall()}
+
+
+async def get_user_ids_to_remove_active(guild_id: int) -> list[int]:
+    """Return user IDs whose last activity is older than 7 days (for role cleanup)."""
+    cutoff = time.time() - ACTIVE_WINDOW_SECONDS
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        cur = await conn.execute(
+            "SELECT user_id FROM active_users WHERE guild_id = ? AND last_activity < ?",
+            (guild_id, cutoff),
+        )
+        return [r[0] for r in await cur.fetchall()]
+
+
+# --- Polls ---
+
+async def create_poll(
+    guild_id: int,
+    channel_id: int,
+    message_id: int,
+    title: str,
+    options: list[str],
+    role_ids: list[int],
+    duration_seconds: int,
+) -> int:
+    """Create a poll. Returns poll ID."""
+    now = time.time()
+    ends_at = now + duration_seconds
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        cur = await conn.execute(
+            """
+            INSERT INTO polls (guild_id, channel_id, message_id, title, options, role_ids, ends_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                guild_id,
+                channel_id,
+                message_id,
+                title,
+                json.dumps(options),
+                json.dumps(role_ids),
+                ends_at,
+                now,
+            ),
+        )
+        await conn.commit()
+        return cur.lastrowid
+
+
+async def get_poll_by_message(guild_id: int, message_id: int) -> dict | None:
+    """Get poll by guild and message ID."""
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            "SELECT * FROM polls WHERE guild_id = ? AND message_id = ?",
+            (guild_id, message_id),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None
+        return dict(row)
+
+
+async def get_poll_by_id(poll_id: int) -> dict | None:
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute("SELECT * FROM polls WHERE id = ?", (poll_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def get_pending_polls() -> list[dict]:
+    """Get all polls that have ended but may need closing."""
+    now = time.time()
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute("SELECT * FROM polls WHERE ends_at <= ?", (now,))
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def add_poll_vote(poll_id: int, user_id: int, option_index: int) -> bool:
+    """Record a vote. Returns True if added, False if already voted for that option."""
+    try:
+        async with aiosqlite.connect(DATABASE_PATH) as conn:
+            await conn.execute(
+                "INSERT INTO poll_votes (poll_id, user_id, option_index) VALUES (?, ?, ?)",
+                (poll_id, user_id, option_index),
+            )
+            await conn.commit()
+            return True
+    except aiosqlite.IntegrityError:
+        return False
+
+
+async def remove_poll_vote(poll_id: int, user_id: int, option_index: int) -> bool:
+    """Remove a vote."""
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        cur = await conn.execute(
+            "DELETE FROM poll_votes WHERE poll_id = ? AND user_id = ? AND option_index = ?",
+            (poll_id, user_id, option_index),
+        )
+        await conn.commit()
+        return cur.rowcount > 0
+
+
+async def get_poll_votes(poll_id: int) -> list[tuple[int, int]]:
+    """Return list of (user_id, option_index) for all votes in the poll."""
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        cur = await conn.execute(
+            "SELECT user_id, option_index FROM poll_votes WHERE poll_id = ?",
+            (poll_id,),
+        )
+        return [(r[0], r[1]) for r in await cur.fetchall()]
+
+
+async def delete_poll(poll_id: int) -> None:
+    """Delete a poll and its votes."""
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        await conn.execute("DELETE FROM polls WHERE id = ?", (poll_id,))
+        await conn.commit()
 
 
