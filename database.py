@@ -208,6 +208,8 @@ async def init_db() -> None:
                 created_at REAL NOT NULL,
                 status TEXT NOT NULL DEFAULT 'stage1_open',
                 preference_options TEXT,
+                preference_duration_seconds INTEGER NOT NULL DEFAULT 0,
+                preference_ends_at REAL,
                 attempts INTEGER NOT NULL DEFAULT 0
             )
         """)
@@ -231,6 +233,7 @@ async def init_db() -> None:
             )
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_stage_polls_ends_at ON stage_polls(ends_at)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_stage_polls_pref_ends_at ON stage_polls(preference_ends_at)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_stage_polls_guild ON stage_polls(guild_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_stage_votes_poll ON stage_poll_votes(poll_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_stage_pref_votes_poll ON stage_poll_pref_votes(poll_id)")
@@ -243,6 +246,16 @@ async def init_db() -> None:
             await db.execute("ALTER TABLE leaderboards ADD COLUMN elo_settings TEXT DEFAULT '{}'")
         except aiosqlite.OperationalError:
             pass  # Column already exists
+
+        # Migration: add stage poll preference timing columns
+        try:
+            await db.execute("ALTER TABLE stage_polls ADD COLUMN preference_duration_seconds INTEGER NOT NULL DEFAULT 0")
+        except aiosqlite.OperationalError:
+            pass
+        try:
+            await db.execute("ALTER TABLE stage_polls ADD COLUMN preference_ends_at REAL")
+        except aiosqlite.OperationalError:
+            pass
 
         await db.commit()
 
@@ -716,14 +729,17 @@ async def create_stage_poll(
     role_ids: list[int],
     num_tiers: int,
     duration_seconds: int,
+    preference_duration_seconds: int,
 ) -> int:
     now = time.time()
     ends_at = now + duration_seconds
     async with aiosqlite.connect(DATABASE_PATH) as conn:
         cur = await conn.execute(
             """
-            INSERT INTO stage_polls (guild_id, channel_id, title, options, role_ids, num_tiers, ends_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO stage_polls (
+                guild_id, channel_id, title, options, role_ids, num_tiers, ends_at, created_at, preference_duration_seconds
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 guild_id,
@@ -734,6 +750,7 @@ async def create_stage_poll(
                 num_tiers,
                 ends_at,
                 now,
+                preference_duration_seconds,
             ),
         )
         await conn.commit()
@@ -777,19 +794,20 @@ async def set_stage_poll_status(
     status: str,
     *,
     preference_options: list[int] | None = None,
+    preference_ends_at: float | None = None,
     attempts: int | None = None,
 ) -> None:
     async with aiosqlite.connect(DATABASE_PATH) as conn:
         pref_json = None if preference_options is None else json.dumps(preference_options)
         if attempts is None:
             await conn.execute(
-                "UPDATE stage_polls SET status = ?, preference_options = ? WHERE id = ?",
-                (status, pref_json, poll_id),
+                "UPDATE stage_polls SET status = ?, preference_options = ?, preference_ends_at = ? WHERE id = ?",
+                (status, pref_json, preference_ends_at, poll_id),
             )
         else:
             await conn.execute(
-                "UPDATE stage_polls SET status = ?, preference_options = ?, attempts = ? WHERE id = ?",
-                (status, pref_json, attempts, poll_id),
+                "UPDATE stage_polls SET status = ?, preference_options = ?, preference_ends_at = ?, attempts = ? WHERE id = ?",
+                (status, pref_json, preference_ends_at, attempts, poll_id),
             )
         await conn.commit()
 
@@ -822,3 +840,28 @@ async def clear_stage_preference_votes(poll_id: int) -> None:
     async with aiosqlite.connect(DATABASE_PATH) as conn:
         await conn.execute("DELETE FROM stage_poll_pref_votes WHERE poll_id = ?", (poll_id,))
         await conn.commit()
+
+
+async def get_pending_stage1_polls() -> list[dict]:
+    now = time.time()
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            "SELECT * FROM stage_polls WHERE status = 'stage1_open' AND ends_at <= ?",
+            (now,),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def get_pending_preference_polls() -> list[dict]:
+    now = time.time()
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            """
+            SELECT * FROM stage_polls
+            WHERE status = 'preference_open' AND preference_ends_at IS NOT NULL AND preference_ends_at <= ?
+            """,
+            (now,),
+        )
+        return [dict(r) for r in await cur.fetchall()]

@@ -123,7 +123,7 @@ class PollCog(commands.Cog):
         active_eligible = [m for m in guild.members if is_eligible(m) and m.id in active_member_ids]
         return len(active_eligible), {m.id for m in active_eligible}
 
-    @poll_group.command(name="create", description="Create a poll (custom UI with reactions)")
+    @poll_group.command(name="preference_create", description="Create a preference poll (reaction voting).")
     async def poll_create(
         self,
         ctx: discord.ApplicationContext,
@@ -193,6 +193,7 @@ class PollCog(commands.Cog):
         title: Option(str, "Proposal title", required=True),
         options: Option(str, "Comma-separated options", required=True),
         duration: Option(str, "Stage 1 duration (e.g. 1d, 24h, 60m)", required=True),
+        preference_duration: Option(str, "Stage 2 preference duration if needed", required=True),
         num_tiers: Option(int, "Number of tiers allowed (n tiers)", required=True),
         roles: Option(
             str,
@@ -214,6 +215,10 @@ class PollCog(commands.Cog):
         if not dur_sec or dur_sec < 60:
             await ctx.respond("Invalid duration. Minimum is 1 minute.", ephemeral=True)
             return
+        pref_dur_sec = parse_duration(preference_duration)
+        if not pref_dur_sec or pref_dur_sec < 60:
+            await ctx.respond("Invalid preference_duration. Minimum is 1 minute.", ephemeral=True)
+            return
         role_ids: list[int] = []
         if roles and roles.strip():
             for rname in [r.strip() for r in roles.split(",") if r.strip()]:
@@ -230,6 +235,7 @@ class PollCog(commands.Cog):
             role_ids=role_ids,
             num_tiers=num_tiers,
             duration_seconds=dur_sec,
+            preference_duration_seconds=pref_dur_sec,
         )
         opt_lines = "\n".join([f"`{i+1}`. {opt}" for i, opt in enumerate(opts)])
         embed = discord.Embed(
@@ -243,7 +249,12 @@ class PollCog(commands.Cog):
             color=0x345995,
             timestamp=discord.utils.utcnow(),
         )
-        embed.set_footer(text=f"Stage 1 closes in {format_duration(dur_sec)}")
+        embed.set_footer(
+            text=(
+                f"Stage 1 closes in {format_duration(dur_sec)} • "
+                f"If Stage 2 opens, it auto-closes in {format_duration(pref_dur_sec)}"
+            )
+        )
         await ctx.channel.send(embed=embed)
         await ctx.respond(f"Two-stage poll created with ID `{poll_id}`.", ephemeral=True)
 
@@ -303,8 +314,16 @@ class PollCog(commands.Cog):
         if poll["status"] != "stage1_open":
             await ctx.respond("Stage 1 is already closed for this poll.", ephemeral=True)
             return
+        await self._close_stage1_and_post(ctx.guild, poll, ctx.channel)
+        await ctx.respond("Stage 1 closed and report posted.", ephemeral=True)
 
-        guild = ctx.guild
+    async def _close_stage1_and_post(
+        self,
+        guild: discord.Guild,
+        poll: dict,
+        channel: discord.abc.Messageable,
+    ) -> None:
+        poll_id = int(poll["id"])
         options: list[str] = json.loads(poll["options"])
         role_ids: list[int] = json.loads(poll["role_ids"]) if poll["role_ids"] else []
         num_tiers = int(poll["num_tiers"])
@@ -365,11 +384,34 @@ class PollCog(commands.Cog):
                 + ("Proposal annulled after 3 failures." if attempts >= 3 else "Proposal should be rescheduled.")
             )
         elif len(t1_idxs) >= 2:
-            await db.set_stage_poll_status(poll_id, "preference_open", preference_options=t1_idxs)
+            pref_secs = int(poll.get("preference_duration_seconds") or 0)
             labels = ", ".join([f"`{i+1}` {options[i]}" for i in t1_idxs])
+            pref_options = [options[i] for i in t1_idxs]
+            pref_lines = [f"{POLL_EMOJIS[i]} {opt}" for i, opt in enumerate(pref_options)]
+            pref_embed = discord.Embed(
+                title=f"🗳️ Stage 2 Preference: {poll['title']} (from ID {poll_id})",
+                description="\n".join(pref_lines),
+                color=0x2E86AB,
+                timestamp=discord.utils.utcnow(),
+            )
+            pref_embed.set_footer(text=f"Closes in {format_duration(pref_secs)} • React to vote (one or more allowed)")
+            pref_msg = await channel.send(embed=pref_embed)
+            for i in range(len(pref_options)):
+                await pref_msg.add_reaction(POLL_EMOJIS[i])
+            await db.create_poll(
+                guild_id=guild.id,
+                channel_id=poll["channel_id"],
+                message_id=pref_msg.id,
+                title=f"[Stage 2] {poll['title']} (from stage poll #{poll_id})",
+                options=pref_options,
+                role_ids=role_ids,
+                duration_seconds=pref_secs,
+            )
+            await db.set_stage_poll_status(poll_id, "preference_open", preference_options=t1_idxs)
             outcome = (
                 "🗳️ Stage 2 preference opened (Tier 1 tie). "
-                f"Eligible options: {labels}. Use `/poll preference_vote` then `/poll preference_close`."
+                f"Eligible options: {labels}. Vote by reaction in the Stage 2 message. "
+                f"It auto-closes in {format_duration(pref_secs)} with results posted automatically."
             )
         elif len(t1_idxs) == 1:
             winner = t1_idxs[0]
@@ -378,24 +420,40 @@ class PollCog(commands.Cog):
         else:
             min_tier = min(assigned_only)
             min_idxs = [i for i, t in enumerate(assignments) if t == min_tier]
-            if len(set(assigned_only)) == 1:
-                await db.set_stage_poll_status(poll_id, "preference_open", preference_options=min_idxs)
+            if len(set(assigned_only)) == 1 or len(min_idxs) > 1:
+                pref_secs = int(poll.get("preference_duration_seconds") or 0)
                 labels = ", ".join([f"`{i+1}` {options[i]}" for i in min_idxs])
-                outcome = (
-                    "🗳️ Stage 2 preference opened (all assigned same tier). "
-                    f"Eligible options: {labels}. Use `/poll preference_vote` then `/poll preference_close`."
+                pref_options = [options[i] for i in min_idxs]
+                pref_lines = [f"{POLL_EMOJIS[i]} {opt}" for i, opt in enumerate(pref_options)]
+                pref_embed = discord.Embed(
+                    title=f"🗳️ Stage 2 Preference: {poll['title']} (from ID {poll_id})",
+                    description="\n".join(pref_lines),
+                    color=0x2E86AB,
+                    timestamp=discord.utils.utcnow(),
                 )
-            elif len(min_idxs) == 1:
+                pref_embed.set_footer(text=f"Closes in {format_duration(pref_secs)} • React to vote (one or more allowed)")
+                pref_msg = await channel.send(embed=pref_embed)
+                for i in range(len(pref_options)):
+                    await pref_msg.add_reaction(POLL_EMOJIS[i])
+                await db.create_poll(
+                    guild_id=guild.id,
+                    channel_id=poll["channel_id"],
+                    message_id=pref_msg.id,
+                    title=f"[Stage 2] {poll['title']} (from stage poll #{poll_id})",
+                    options=pref_options,
+                    role_ids=role_ids,
+                    duration_seconds=pref_secs,
+                )
+                await db.set_stage_poll_status(poll_id, "preference_open", preference_options=min_idxs)
+                outcome = (
+                    "🗳️ Stage 2 preference opened. "
+                    f"Eligible options: {labels}. Vote by reaction in the Stage 2 message. "
+                    f"It auto-closes in {format_duration(pref_secs)} with results posted automatically."
+                )
+            else:
                 winner = min_idxs[0]
                 await db.set_stage_poll_status(poll_id, "passed_auto")
                 outcome = f"✅ Auto-selected option `{winner+1}` ({options[winner]}) — lowest assigned tier."
-            else:
-                await db.set_stage_poll_status(poll_id, "preference_open", preference_options=min_idxs)
-                labels = ", ".join([f"`{i+1}` {options[i]}" for i in min_idxs])
-                outcome = (
-                    "🗳️ Stage 2 preference opened (tie at best assigned tier). "
-                    f"Eligible options: {labels}. Use `/poll preference_vote` then `/poll preference_close`."
-                )
 
         embed = discord.Embed(
             title=f"📊 Stage 1 Results: {poll['title']} (ID {poll_id})",
@@ -403,123 +461,7 @@ class PollCog(commands.Cog):
             color=0x2E86AB,
             timestamp=discord.utils.utcnow(),
         )
-        await ctx.channel.send(embed=embed)
-        await ctx.respond("Stage 1 closed and report posted.", ephemeral=True)
-
-    @poll_group.command(name="preference_vote", description="Vote in Stage 2 preference round.")
-    async def preference_vote(
-        self,
-        ctx: discord.ApplicationContext,
-        poll_id: Option(int, "Stage poll ID", required=True),
-        option_index: Option(int, "Option number (1-based)", required=True),
-    ) -> None:
-        if not ctx.guild or not ctx.author:
-            await ctx.respond("Must be used in a server.", ephemeral=True)
-            return
-        poll = await db.get_stage_poll_by_id(poll_id)
-        if not poll or poll["guild_id"] != ctx.guild.id:
-            await ctx.respond("Stage poll not found.", ephemeral=True)
-            return
-        if poll["status"] != "preference_open":
-            await ctx.respond("Preference stage is not open for this poll.", ephemeral=True)
-            return
-        options = json.loads(poll["options"])
-        pref_opts = json.loads(poll["preference_options"]) if poll["preference_options"] else []
-        oi = option_index - 1
-        if oi not in pref_opts:
-            allowed = ", ".join(str(i + 1) for i in pref_opts)
-            await ctx.respond(f"Option must be one of: {allowed}.", ephemeral=True)
-            return
-        role_ids: list[int] = json.loads(poll["role_ids"]) if poll["role_ids"] else []
-        if role_ids and not any(r.id in role_ids for r in ctx.author.roles):
-            await ctx.respond("You are not eligible to vote on this poll.", ephemeral=True)
-            return
-        await db.add_stage_preference_vote(poll_id, ctx.author.id, oi)
-        await grant_active_and_record(ctx.guild, ctx.author)
-        await ctx.respond(f"Preference vote recorded for option `{option_index}` ({options[oi]}).", ephemeral=True)
-
-    @poll_group.command(name="preference_close", description="Close Stage 2 preference and determine result.")
-    async def preference_close(
-        self,
-        ctx: discord.ApplicationContext,
-        poll_id: Option(int, "Stage poll ID", required=True),
-    ) -> None:
-        if not ctx.guild or not ctx.author:
-            await ctx.respond("Must be used in a server.", ephemeral=True)
-            return
-        perms = ctx.author.guild_permissions
-        if not (perms.administrator or perms.manage_guild or perms.manage_messages):
-            await ctx.respond("You need Administrator, Manage Server, or Manage Messages permission.", ephemeral=True)
-            return
-        poll = await db.get_stage_poll_by_id(poll_id)
-        if not poll or poll["guild_id"] != ctx.guild.id:
-            await ctx.respond("Stage poll not found.", ephemeral=True)
-            return
-        if poll["status"] != "preference_open":
-            await ctx.respond("Preference stage is not open for this poll.", ephemeral=True)
-            return
-
-        options = json.loads(poll["options"])
-        pref_opts = json.loads(poll["preference_options"]) if poll["preference_options"] else []
-        role_ids: list[int] = json.loads(poll["role_ids"]) if poll["role_ids"] else []
-        num_active_eligible, active_eligible_ids = await self._get_active_eligible_ids(ctx.guild, role_ids)
-        votes = await db.get_stage_preference_votes(poll_id)
-        valid_votes = [(u, oi) for (u, oi) in votes if u in active_eligible_ids and oi in pref_opts]
-        num_valid_voters = len({u for u, _ in valid_votes})
-
-        counts = [0] * len(options)
-        for _, oi in valid_votes:
-            counts[oi] += 1
-        scoped_counts = [counts[i] for i in pref_opts]
-        total_valid_votes = sum(scoped_counts)
-        n_eff = compute_n_eff(scoped_counts)
-        p_win = compute_pwin(n_eff)
-        quorum_met = num_valid_voters >= (QUORUM_PERCENT * num_active_eligible)
-
-        if total_valid_votes > 0:
-            local_max = max(scoped_counts)
-            local_idx = scoped_counts.index(local_max)
-            winner_idx = pref_opts[local_idx]
-            win_pct = local_max / total_valid_votes
-        else:
-            winner_idx = None
-            win_pct = 0.0
-
-        passed = quorum_met and winner_idx is not None and win_pct >= p_win
-        attempts = int(poll["attempts"])
-        if passed:
-            await db.set_stage_poll_status(poll_id, "passed_preference")
-            outcome = f"✅ Preference passed. Winner: `{winner_idx+1}` ({options[winner_idx]})."
-        else:
-            attempts += 1
-            new_status = "annulled" if attempts >= 3 else "failed_preference"
-            await db.set_stage_poll_status(poll_id, new_status, attempts=attempts)
-            outcome = (
-                "❌ Preference did not pass."
-                + (" Proposal annulled after 3 failures." if attempts >= 3 else " Proposal should be rescheduled.")
-            )
-            if not quorum_met:
-                outcome += " (Quorum not met.)"
-
-        lines = [
-            f"**Active Eligible Voters:** {num_active_eligible}",
-            f"**Valid Voters:** {num_valid_voters}",
-            f"**Valid Votes:** {total_valid_votes}",
-            f"**Simpson n_eff:** {n_eff:.3f}",
-            f"**Required p_win:** {p_win*100:.1f}%",
-            f"**Winner share:** {win_pct*100:.1f}%",
-            "",
-            outcome,
-        ]
-        embed = discord.Embed(
-            title=f"🗳️ Stage 2 Preference Result: {poll['title']} (ID {poll_id})",
-            description="\n".join(lines),
-            color=0x2E86AB if passed else 0x8B0000,
-            timestamp=discord.utils.utcnow(),
-        )
-        await ctx.channel.send(embed=embed)
-        await ctx.respond("Preference stage closed and result posted.", ephemeral=True)
-        await db.clear_stage_preference_votes(poll_id)
+        await channel.send(embed=embed)
 
     @poll_group.command(name="delete", description="Remove a poll from the bot (Mod/Admin). Optionally delete the message.")
     async def poll_delete(
@@ -593,6 +535,15 @@ class PollCog(commands.Cog):
         for poll in pending:
             await self._close_poll(poll)
             await db.delete_poll(poll["id"])
+        pending_stage1 = await db.get_pending_stage1_polls()
+        for poll in pending_stage1:
+            guild = self.bot.get_guild(poll["guild_id"])
+            if not guild:
+                continue
+            channel = guild.get_channel(poll["channel_id"])
+            if not channel or not isinstance(channel, discord.TextChannel):
+                continue
+            await self._close_stage1_and_post(guild, poll, channel)
 
     async def _close_poll(self, poll: dict) -> None:
         guild = self.bot.get_guild(poll["guild_id"])

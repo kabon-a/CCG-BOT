@@ -78,13 +78,12 @@ A Discord bot for Yu-Gi-Oh! format management: ELO ranking, archetype tier lists
 
 | Command | Description |
 |---------|-------------|
-| `/poll create <title> <options> <duration> [roles]` | Create a poll. Options are comma-separated; duration uses `1d`, `24h`, `60m` format; roles restrict who can vote (omit for everyone). |
+| `/poll preference_create <title> <options> <duration> [roles]` | Create a preference poll (reaction voting). Options are comma-separated; duration uses `1d`, `24h`, `60m` format; roles restrict who can vote (omit for everyone). |
 | `/poll delete <poll_id> [delete_message]` | Remove a poll from the bot (Mod/Admin). By default also deletes the poll message in Discord. |
-| `/poll stage_create <title> <options> <duration> <num_tiers> [roles]` | Create a two-stage tier poll (Stage 1 tier assignment + Stage 2 preference if needed). |
+| `/poll stage_create <title> <options> <duration> <preference_duration> <num_tiers> [roles]` | Create a two-stage tier poll (Stage 1 tier assignment + Stage 2 preference if needed), with Stage 2 auto-close duration set up-front. |
 | `/poll stage_vote <poll_id> <option_index> <tier>` | Submit/update your Stage 1 tier input for an option. |
 | `/poll stage_close <poll_id>` | Close Stage 1, compute Simpson thresholds + EV fallback, and apply outcome rules. |
-| `/poll preference_vote <poll_id> <option_index>` | Vote in Stage 2 preference when opened by Stage 1 outcome. |
-| `/poll preference_close <poll_id>` | Close Stage 2 and finalize via Simpson threshold + quorum. |
+| `Stage 2 preference` | Opened automatically from Stage 1 when required. Voting is by **reaction** in the Stage 2 message; closes automatically using `preference_duration`. |
 
 Polls use reaction-based voting (users may vote on multiple options). When a poll closes, the bot posts a report with:
 - No. of Active Eligible Voters (eligible roles + @active)
