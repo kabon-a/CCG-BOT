@@ -2,6 +2,8 @@
 
 A Discord bot for Yu-Gi-Oh! format management: ELO ranking, archetype tier lists, courtroom-style polls with Shannon-based thresholds, and @active role tracking for proposal eligibility.
 
+**Live leaderboards:** `/leaderboard view`, `rankings`, `tierlist`, and `tiers` post a **channel message** (not only a slash reply) that the bot **re-edits automatically** when rankings, roster, ELO settings, or tier list data change. Run the command again in the same channel to replace that message.
+
 **Features:**
 - **Leaderboards** — ELO ranking for members and archetype meta tier lists
 - **Polls** — Courtroom-style polls with role-based eligibility, quorum (65%), and Shannon-derived winning threshold
@@ -44,7 +46,9 @@ A Discord bot for Yu-Gi-Oh! format management: ELO ranking, archetype tier lists
 | `/leaderboard match <leaderboard> <winner> <loser> <winner_deck> <loser_deck>` | Record a match (updates member ELO + archetype tier list) |
 | `/leaderboard customize <leaderboard> <display_name>` | Set your display name on a leaderboard |
 | `/leaderboard view [leaderboard]` | View the member ELO leaderboard |
+| `/leaderboard rankings [leaderboard]` | Display member ELO rankings (same as `view`) |
 | `/leaderboard tierlist` | View the archetype/deck tier list (meta strength by win-rate) |
+| `/leaderboard tiers` | Display archetype tier list (same as `tierlist`) |
 | `/leaderboard remove <leaderboard>` | Remove yourself from a leaderboard |
 | `/leaderboard reset <name>` | Reset all ELOs on a leaderboard (Mod/Admin) |
 | `/leaderboard reset_tierlist` | Reset archetype tier list (Mod/Admin) |
@@ -75,6 +79,7 @@ A Discord bot for Yu-Gi-Oh! format management: ELO ranking, archetype tier lists
 | Command | Description |
 |---------|-------------|
 | `/poll create <title> <options> <duration> [roles]` | Create a poll. Options are comma-separated; duration uses `1d`, `24h`, `60m` format; roles restrict who can vote (omit for everyone). |
+| `/poll delete <poll_id> [delete_message]` | Remove a poll from the bot (Mod/Admin). By default also deletes the poll message in Discord. |
 
 Polls use reaction-based voting (users may vote on multiple options). When a poll closes, the bot posts a report with:
 - No. of Active Eligible Voters (eligible roles + @active)

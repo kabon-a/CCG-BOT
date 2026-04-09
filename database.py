@@ -135,6 +135,26 @@ async def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_leaderboards_guild ON leaderboards(guild_id)
         """)
 
+        # Live-updating leaderboard / tier list messages (channel embeds the bot edits)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS live_leaderboard_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                leaderboard_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                channel_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                UNIQUE(guild_id, leaderboard_id, channel_id, kind),
+                CHECK (kind IN ('rankings', 'tierlist'))
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_live_lb_guild ON live_leaderboard_messages(guild_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_live_lb_lookup ON live_leaderboard_messages(guild_id, leaderboard_id, kind)"
+        )
+
         # Active users (for @active role, last_activity within 7 days)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS active_users (
@@ -223,6 +243,22 @@ async def get_leaderboard_id(guild_id: int, name: str) -> int | None:
         )
         row = await cur.fetchone()
         return row[0] if row else None
+
+
+async def get_leaderboard_by_id(leaderboard_id: int) -> dict | None:
+    """Return {id, guild_id, name} or None."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT id, guild_id, name FROM leaderboards WHERE id = ?",
+            (leaderboard_id,),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+# Sentinel leaderboard_id for guild-wide tier list live messages
+LIVE_TIERLIST_LEADERBOARD_ID = 0
 
 
 async def get_leaderboard_settings(leaderboard_id: int) -> EloSettings:
@@ -414,6 +450,70 @@ async def delete_leaderboard(guild_id: int, name: str) -> bool:
         await db.execute("DELETE FROM leaderboards WHERE id = ?", (lb_id,))
         await db.commit()
     return True
+
+
+# --- Live leaderboard / tier list channel messages ---
+
+
+async def upsert_live_display(
+    guild_id: int,
+    leaderboard_id: int,
+    kind: str,
+    channel_id: int,
+    message_id: int,
+) -> None:
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        await conn.execute(
+            """
+            INSERT INTO live_leaderboard_messages (guild_id, leaderboard_id, kind, channel_id, message_id)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, leaderboard_id, channel_id, kind)
+            DO UPDATE SET message_id = excluded.message_id
+            """,
+            (guild_id, leaderboard_id, kind, channel_id, message_id),
+        )
+        await conn.commit()
+
+
+async def get_live_displays(guild_id: int, leaderboard_id: int, kind: str) -> list[tuple[int, int, int]]:
+    """Return list of (row_id, channel_id, message_id)."""
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        cur = await conn.execute(
+            """
+            SELECT id, channel_id, message_id FROM live_leaderboard_messages
+            WHERE guild_id = ? AND leaderboard_id = ? AND kind = ?
+            """,
+            (guild_id, leaderboard_id, kind),
+        )
+        return [(r[0], r[1], r[2]) for r in await cur.fetchall()]
+
+
+async def delete_live_display_row(row_id: int) -> None:
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        await conn.execute("DELETE FROM live_leaderboard_messages WHERE id = ?", (row_id,))
+        await conn.commit()
+
+
+async def delete_live_rankings_for_leaderboard(guild_id: int, leaderboard_id: int) -> list[tuple[int, int]]:
+    """Remove DB rows; return (channel_id, message_id) for optional Discord cleanup."""
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        cur = await conn.execute(
+            """
+            SELECT channel_id, message_id FROM live_leaderboard_messages
+            WHERE guild_id = ? AND leaderboard_id = ? AND kind = 'rankings'
+            """,
+            (guild_id, leaderboard_id),
+        )
+        pairs = [(r[0], r[1]) for r in await cur.fetchall()]
+        await conn.execute(
+            """
+            DELETE FROM live_leaderboard_messages
+            WHERE guild_id = ? AND leaderboard_id = ? AND kind = 'rankings'
+            """,
+            (guild_id, leaderboard_id),
+        )
+        await conn.commit()
+    return pairs
 
 
 # --- Active users (for @active role) ---

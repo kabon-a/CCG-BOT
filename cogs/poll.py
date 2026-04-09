@@ -135,6 +135,42 @@ class PollCog(commands.Cog):
         )
         await ctx.respond(f"Poll created. ID: {poll_id}", ephemeral=True)
 
+    @poll_group.command(name="delete", description="Remove a poll from the bot (Mod/Admin). Optionally delete the message.")
+    async def poll_delete(
+        self,
+        ctx: discord.ApplicationContext,
+        poll_id: Option(int, "Poll ID (shown when the poll was created)", required=True),
+        delete_message: Option(
+            bool,
+            "Try to delete the poll message in Discord (default: true)",
+            required=False,
+        ) = True,
+    ) -> None:
+        if not ctx.guild or not ctx.author:
+            await ctx.respond("Must be used in a server.", ephemeral=True)
+            return
+        perms = ctx.author.guild_permissions
+        if not (perms.administrator or perms.manage_guild or perms.manage_messages):
+            await ctx.respond("You need Administrator, Manage Server, or Manage Messages permission.", ephemeral=True)
+            return
+
+        poll = await db.get_poll_by_id(poll_id)
+        if not poll or poll["guild_id"] != ctx.guild.id:
+            await ctx.respond(f"No poll with ID **{poll_id}** in this server.", ephemeral=True)
+            return
+
+        if delete_message:
+            channel = ctx.guild.get_channel(poll["channel_id"])
+            if channel and isinstance(channel, discord.TextChannel):
+                try:
+                    msg = await channel.fetch_message(poll["message_id"])
+                    await msg.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+
+        await db.delete_poll(poll_id)
+        await ctx.respond(f"Poll **{poll_id}** removed from the bot.", ephemeral=True)
+
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
         if payload.user_id == self.bot.user.id:
