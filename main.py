@@ -22,6 +22,7 @@ async def on_ready() -> None:
 
 
 def main() -> None:
+    asyncio.run(db.init_db())
     bot.load_extension("cogs.leaderboard")
     bot.load_extension("cogs.announce")
     bot.load_extension("cogs.active")
