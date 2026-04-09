@@ -247,7 +247,7 @@ async def init_db() -> None:
                 source_lang TEXT NOT NULL,
                 target_lang TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
-                ttl_seconds INTEGER NOT NULL DEFAULT 30,
+                ttl_seconds INTEGER NOT NULL DEFAULT 10,
                 PRIMARY KEY (guild_id, user_id)
             )
             """

@@ -57,7 +57,7 @@ class TranslateCog(commands.Cog):
         ctx: discord.ApplicationContext,
         source_lang: Option(str, "Language A code. Leave empty for auto-detect", required=False) = None,
         target_lang: Option(str, "Language B code. Leave empty to use your first language", required=False) = None,
-        ttl_seconds: Option(int, "Temporary message lifetime in seconds (5-300)", required=False) = 30,
+        ttl_seconds: Option(int, "Temporary message lifetime in seconds (5-300)", required=False) = 10,
     ) -> None:
         if not ctx.guild or not ctx.author:
             await ctx.respond("Must be used in a server.", ephemeral=True)
@@ -129,6 +129,10 @@ class TranslateCog(commands.Cog):
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
 
+    @staticmethod
+    def _normalize_compare_text(s: str) -> str:
+        return re.sub(r"\s+", " ", s).strip().lower()
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         if not message.guild or not message.author or message.author.bot:
@@ -162,17 +166,24 @@ class TranslateCog(commands.Cog):
             elif detected.lower() != source_lang:
                 continue
             target_lang = str(pref["target_lang"]).lower()
-            ttl = int(pref.get("ttl_seconds") or 30)
+            ttl = int(pref.get("ttl_seconds") or 10)
+
+            # Skip if already detected as target language.
+            if detected.lower() == target_lang:
+                continue
 
             translated = await self._translate_text(message.content, source_lang, target_lang)
             if not translated:
                 continue
+            # Skip no-op translations (common on short English messages).
+            if self._normalize_compare_text(translated) == self._normalize_compare_text(message.content):
+                continue
 
             try:
-                out = await message.channel.send(
-                    f"🔤 <@{uid}> translation ({source_lang} → {target_lang}) from "
-                    f"**{message.author.display_name}**: {translated}"
-                )
+                recipient = message.guild.get_member(uid) or self.bot.get_user(uid)
+                if not recipient:
+                    continue
+                out = await recipient.send(f"@{message.author.display_name}: {translated}")
                 asyncio.create_task(self._delete_later(out, ttl))
-            except discord.HTTPException:
+            except (discord.Forbidden, discord.HTTPException):
                 continue
