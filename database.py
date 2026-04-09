@@ -238,6 +238,39 @@ async def init_db() -> None:
         await db.execute("CREATE INDEX IF NOT EXISTS idx_stage_votes_poll ON stage_poll_votes(poll_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_stage_pref_votes_poll ON stage_poll_pref_votes(poll_id)")
 
+        # Auto-translate preferences (per user per guild)
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auto_translate_prefs (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                source_lang TEXT NOT NULL,
+                target_lang TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                ttl_seconds INTEGER NOT NULL DEFAULT 30,
+                PRIMARY KEY (guild_id, user_id)
+            )
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_auto_translate_guild_enabled ON auto_translate_prefs(guild_id, enabled)"
+        )
+
+        # Per-user first language preferences (default English if missing)
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_language_prefs (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                first_language TEXT NOT NULL DEFAULT 'en',
+                PRIMARY KEY (guild_id, user_id)
+            )
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_language_guild ON user_language_prefs(guild_id)"
+        )
+
         # Migration: drop old entries table (legacy card-based schema)
         await db.execute("DROP TABLE IF EXISTS entries")
 
@@ -865,3 +898,95 @@ async def get_pending_preference_polls() -> list[dict]:
             (now,),
         )
         return [dict(r) for r in await cur.fetchall()]
+
+
+# --- Auto-translate preferences ---
+
+async def upsert_auto_translate_pref(
+    guild_id: int,
+    user_id: int,
+    source_lang: str,
+    target_lang: str,
+    ttl_seconds: int,
+    enabled: bool = True,
+) -> None:
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        await conn.execute(
+            """
+            INSERT INTO auto_translate_prefs (guild_id, user_id, source_lang, target_lang, enabled, ttl_seconds)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, user_id)
+            DO UPDATE SET
+                source_lang = excluded.source_lang,
+                target_lang = excluded.target_lang,
+                enabled = excluded.enabled,
+                ttl_seconds = excluded.ttl_seconds
+            """,
+            (guild_id, user_id, source_lang.lower().strip(), target_lang.lower().strip(), 1 if enabled else 0, ttl_seconds),
+        )
+        await conn.commit()
+
+
+async def disable_auto_translate_pref(guild_id: int, user_id: int) -> bool:
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        cur = await conn.execute(
+            "UPDATE auto_translate_prefs SET enabled = 0 WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        )
+        await conn.commit()
+        return cur.rowcount > 0
+
+
+async def get_auto_translate_pref(guild_id: int, user_id: int) -> dict | None:
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            "SELECT * FROM auto_translate_prefs WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def get_enabled_auto_translate_prefs(guild_id: int) -> list[dict]:
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            "SELECT * FROM auto_translate_prefs WHERE guild_id = ? AND enabled = 1",
+            (guild_id,),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def set_user_first_language(guild_id: int, user_id: int, lang_code: str) -> None:
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        await conn.execute(
+            """
+            INSERT INTO user_language_prefs (guild_id, user_id, first_language)
+            VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, user_id)
+            DO UPDATE SET first_language = excluded.first_language
+            """,
+            (guild_id, user_id, lang_code.lower().strip()),
+        )
+        await conn.commit()
+
+
+async def get_user_first_language(guild_id: int, user_id: int) -> str:
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        cur = await conn.execute(
+            "SELECT first_language FROM user_language_prefs WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        )
+        row = await cur.fetchone()
+        return (row[0] if row and row[0] else "en").lower().strip()
+
+
+async def get_guild_first_languages(guild_id: int) -> dict[int, str]:
+    """Return {user_id: first_language}. Missing users imply English."""
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        cur = await conn.execute(
+            "SELECT user_id, first_language FROM user_language_prefs WHERE guild_id = ?",
+            (guild_id,),
+        )
+        return {int(r[0]): str(r[1]).lower().strip() for r in await cur.fetchall()}

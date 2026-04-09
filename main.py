@@ -28,6 +28,7 @@ def main() -> None:
     bot.load_extension("cogs.announce")
     bot.load_extension("cogs.active")
     bot.load_extension("cogs.poll")
+    bot.load_extension("cogs.translate")
     bot.run(BOT_TOKEN)
 
 

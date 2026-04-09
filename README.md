@@ -7,6 +7,7 @@ A Discord bot for Yu-Gi-Oh! format management: ELO ranking, archetype tier lists
 **Features:**
 - **Leaderboards** — ELO ranking for members and archetype meta tier lists
 - **Polls** — Courtroom-style polls with role-based eligibility, quorum (65%), Simpson-derived winning thresholds, and two-stage tier voting
+- **Auto-translate mode** — Per-user language A -> B temporary translations for incoming messages
 - **@active role** — Automatically assigned to users with recent activity (messages, reactions, voting); removed after 7 days of inactivity
 
 ## Setup
@@ -72,7 +73,7 @@ A Discord bot for Yu-Gi-Oh! format management: ELO ranking, archetype tier lists
 
 | Command | Description |
 |---------|-------------|
-| `/announce <message> [channel]` | Send a message through the bot (Mod/Admin). Default: current channel. |
+| `/announce <message> [channel]` | Send a message through the bot (Mod/Admin). Default: current channel. Also posts grouped translations based on audience first-language preferences. |
 
 ### Poll (Courtroom-style)
 
@@ -90,6 +91,16 @@ Polls use reaction-based voting (users may vote on multiple options). When a pol
 - Total Valid Voters and Valid Votes
 - Simpson-based winning threshold (Pwin = 1.5 / (n_eff + 0.5), n_eff = 1 / Σ p_i²)
 - Pass/fail verdict (quorum 65%, winning % must meet threshold)
+
+### Auto Translate
+
+| Command | Description |
+|---------|-------------|
+| `/translate_mode enable [source_lang] [target_lang] [ttl_seconds]` | Enable per-user auto-translate. If `source_lang` is omitted, auto-detect any language different from your first language. If `target_lang` is omitted, your first language is used. |
+| `/translate_mode disable` | Disable auto-translate for yourself in this server. |
+| `/translate_mode status` | Show your current auto-translate settings. |
+| `/language set <lang_code>` | Set your first language (default is `en`). |
+| `/language status` | Show your first language. |
 
 ### @active Role
 
