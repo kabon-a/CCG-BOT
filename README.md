@@ -1,12 +1,12 @@
 # CCG ELO Bot
 
-A Discord bot for Yu-Gi-Oh! format management: ELO ranking, archetype tier lists, courtroom-style polls with Shannon-based thresholds, and @active role tracking for proposal eligibility.
+A Discord bot for Yu-Gi-Oh! format management: ELO ranking, archetype tier lists, courtroom-style polls with Simpson-based thresholds, and @active role tracking for proposal eligibility.
 
 **Live leaderboards:** `/leaderboard view`, `rankings`, `tierlist`, and `tiers` post a **channel message** (not only a slash reply) that the bot **re-edits automatically** when rankings, roster, ELO settings, or tier list data change. Run the command again in the same channel to replace that message.
 
 **Features:**
 - **Leaderboards** — ELO ranking for members and archetype meta tier lists
-- **Polls** — Courtroom-style polls with role-based eligibility, quorum (65%), and Shannon-derived winning threshold
+- **Polls** — Courtroom-style polls with role-based eligibility, quorum (65%), Simpson-derived winning thresholds, and two-stage tier voting
 - **@active role** — Automatically assigned to users with recent activity (messages, reactions, voting); removed after 7 days of inactivity
 
 ## Setup
@@ -80,11 +80,16 @@ A Discord bot for Yu-Gi-Oh! format management: ELO ranking, archetype tier lists
 |---------|-------------|
 | `/poll create <title> <options> <duration> [roles]` | Create a poll. Options are comma-separated; duration uses `1d`, `24h`, `60m` format; roles restrict who can vote (omit for everyone). |
 | `/poll delete <poll_id> [delete_message]` | Remove a poll from the bot (Mod/Admin). By default also deletes the poll message in Discord. |
+| `/poll stage_create <title> <options> <duration> <num_tiers> [roles]` | Create a two-stage tier poll (Stage 1 tier assignment + Stage 2 preference if needed). |
+| `/poll stage_vote <poll_id> <option_index> <tier>` | Submit/update your Stage 1 tier input for an option. |
+| `/poll stage_close <poll_id>` | Close Stage 1, compute Simpson thresholds + EV fallback, and apply outcome rules. |
+| `/poll preference_vote <poll_id> <option_index>` | Vote in Stage 2 preference when opened by Stage 1 outcome. |
+| `/poll preference_close <poll_id>` | Close Stage 2 and finalize via Simpson threshold + quorum. |
 
 Polls use reaction-based voting (users may vote on multiple options). When a poll closes, the bot posts a report with:
 - No. of Active Eligible Voters (eligible roles + @active)
 - Total Valid Voters and Valid Votes
-- Shannon-based winning threshold (Pwin = 1.5 / (n_eff + 0.5))
+- Simpson-based winning threshold (Pwin = 1.5 / (n_eff + 0.5), n_eff = 1 / Σ p_i²)
 - Pass/fail verdict (quorum 65%, winning % must meet threshold)
 
 ### @active Role
