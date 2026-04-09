@@ -1,5 +1,6 @@
 """CCG ELO Bot - Yu-Gi-Oh! card name leaderboards."""
 
+import asyncio
 import discord
 from discord.ext import commands
 
