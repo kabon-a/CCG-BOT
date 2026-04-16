@@ -116,4 +116,12 @@ The bot assigns the `@active` role to users who interact with the server (messag
 
 Deck names are normalized (case, spacing) so "Salamangreat" and "salamangreat" count as the same archetype.
 
-Data is stored in `data/ccg_elo.db` (SQLite).
+Data is stored in SQLite at `DATABASE_PATH` (default `data/ccg_elo.db`).
+
+For Railway (or any auto-redeploy host), use persistent storage so data survives push/redeploy:
+
+1. Attach a persistent volume.
+2. Set env var `DATABASE_PATH` to a file on that volume (example: `/data/ccg_elo.db`).
+3. Redeploy once.
+
+If `DATABASE_PATH` points to ephemeral container storage, leaderboard/poll data can be lost on redeploy.
