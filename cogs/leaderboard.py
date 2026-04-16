@@ -1047,52 +1047,59 @@ class LeaderboardCog(commands.Cog):
         winner_deck: Option(str, "Deck/archetype the winner used (e.g. Salamangreat)", required=True),
         loser_deck: Option(str, "Deck/archetype the loser used", required=True),
     ) -> None:
-        guild_id = ctx.guild.id if ctx.guild else 0
-        lb_id = await db.get_leaderboard_id(guild_id, _parse_leaderboard_name_from_autocomplete(leaderboard))
-        if not lb_id:
-            await ctx.respond(f"No leaderboard named **{leaderboard}**.", ephemeral=True)
-            return
-        wmem = await db.get_member_entry(lb_id, winner.id)
-        lmem = await db.get_member_entry(lb_id, loser.id)
-        if not wmem or not lmem:
-            await ctx.respond(
-                "One or both members are not on this leaderboard. They must use `/leaderboard add` first.",
-                ephemeral=True,
-            )
-            return
-        st = await db.get_leaderboard_settings(lb_id)
-        if st.locked:
-            await ctx.respond(
-                f"**{leaderboard}** is locked — no new matches can be recorded until a moderator unlocks it.",
-                ephemeral=True,
-            )
-            return
-        meta = await db.get_leaderboard_by_id(lb_id)
-        if meta and meta.get("match_format", "1v1") != "1v1":
-            await ctx.respond(
-                "This leaderboard is **2v2**. Use `/leaderboard match_2v2` with two winners and two losers.",
-                ephemeral=True,
-            )
-            return
+        await ctx.defer()
+        try:
+            guild_id = ctx.guild.id if ctx.guild else 0
+            lb_id = await db.get_leaderboard_id(guild_id, _parse_leaderboard_name_from_autocomplete(leaderboard))
+            if not lb_id:
+                await ctx.followup.send(f"No leaderboard named **{leaderboard}**.", ephemeral=True)
+                return
+            wmem = await db.get_member_entry(lb_id, winner.id)
+            lmem = await db.get_member_entry(lb_id, loser.id)
+            if not wmem or not lmem:
+                await ctx.followup.send(
+                    "One or both members are not on this leaderboard. They must use `/leaderboard add` first.",
+                    ephemeral=True,
+                )
+                return
+            st = await db.get_leaderboard_settings(lb_id)
+            if st.locked:
+                await ctx.followup.send(
+                    f"**{leaderboard}** is locked — no new matches can be recorded until a moderator unlocks it.",
+                    ephemeral=True,
+                )
+                return
+            meta = await db.get_leaderboard_by_id(lb_id)
+            if meta and meta.get("match_format", "1v1") != "1v1":
+                await ctx.followup.send(
+                    "This leaderboard is **2v2**. Use `/leaderboard match_2v2` with two winners and two losers.",
+                    ephemeral=True,
+                )
+                return
 
-        ok = await db.record_match(
-            guild_id,
-            lb_id,
-            winner.id,
-            loser.id,
-            winner_deck,
-            loser_deck,
-            actor_id=ctx.author.id,
-        )
-        if ok:
-            await ctx.respond(
-                f"Recorded: **{winner.display_name}** ({winner_deck}) defeated **{loser.display_name}** ({loser_deck}) on **{leaderboard}**. "
-                "Player ELO updated; archetype AA-ELO updated (1v1)."
+            ok = await db.record_match(
+                guild_id,
+                lb_id,
+                winner.id,
+                loser.id,
+                winner_deck,
+                loser_deck,
+                actor_id=ctx.author.id,
             )
-            await self.refresh_rankings_displays(guild_id, lb_id)
-            await self.refresh_tierlist_displays(guild_id)
-        else:
-            await ctx.respond("Could not record the match (try again).", ephemeral=True)
+            if ok:
+                await ctx.followup.send(
+                    f"Recorded: **{winner.display_name}** ({winner_deck}) defeated **{loser.display_name}** ({loser_deck}) on **{leaderboard}**. "
+                    "Player ELO updated; archetype AA-ELO updated (1v1)."
+                )
+                await self.refresh_rankings_displays(guild_id, lb_id)
+                await self.refresh_tierlist_displays(guild_id)
+            else:
+                await ctx.followup.send("Could not record the match (try again).", ephemeral=True)
+        except Exception:
+            await ctx.followup.send(
+                "Could not record this match due to an internal error. Please try again in a few seconds.",
+                ephemeral=True,
+            )
 
     @leaderboard_group.command(
         name="match_2v2",
@@ -1111,59 +1118,66 @@ class LeaderboardCog(commands.Cog):
         loser1_deck: Option(str, "Loser 1 deck", required=True),
         loser2_deck: Option(str, "Loser 2 deck", required=True),
     ) -> None:
-        guild_id = ctx.guild.id if ctx.guild else 0
-        lb_id = await db.get_leaderboard_id(guild_id, _parse_leaderboard_name_from_autocomplete(leaderboard))
-        if not lb_id:
-            await ctx.respond(f"No leaderboard named **{leaderboard}**.", ephemeral=True)
-            return
-        meta = await db.get_leaderboard_by_id(lb_id)
-        if not meta or meta.get("match_format", "1v1") != "2v2":
-            await ctx.respond(
-                "This leaderboard is not a **2v2** board. Create one with `/leaderboard create` (format 2v2) or use `/leaderboard match`.",
-                ephemeral=True,
-            )
-            return
-        st = await db.get_leaderboard_settings(lb_id)
-        if st.locked:
-            await ctx.respond(
-                f"**{leaderboard}** is locked — no new matches can be recorded until a moderator unlocks it.",
-                ephemeral=True,
-            )
-            return
-        ids = {winner1.id, winner2.id, loser1.id, loser2.id}
-        if len(ids) < 4:
-            await ctx.respond("All **four** players must be different members.", ephemeral=True)
-            return
-        for m in (winner1, winner2, loser1, loser2):
-            if not await db.get_member_entry(lb_id, m.id):
-                await ctx.respond(
-                    f"**{m.display_name}** is not on this leaderboard — they must `/leaderboard add` first.",
+        await ctx.defer()
+        try:
+            guild_id = ctx.guild.id if ctx.guild else 0
+            lb_id = await db.get_leaderboard_id(guild_id, _parse_leaderboard_name_from_autocomplete(leaderboard))
+            if not lb_id:
+                await ctx.followup.send(f"No leaderboard named **{leaderboard}**.", ephemeral=True)
+                return
+            meta = await db.get_leaderboard_by_id(lb_id)
+            if not meta or meta.get("match_format", "1v1") != "2v2":
+                await ctx.followup.send(
+                    "This leaderboard is not a **2v2** board. Create one with `/leaderboard create` (format 2v2) or use `/leaderboard match`.",
                     ephemeral=True,
                 )
                 return
+            st = await db.get_leaderboard_settings(lb_id)
+            if st.locked:
+                await ctx.followup.send(
+                    f"**{leaderboard}** is locked — no new matches can be recorded until a moderator unlocks it.",
+                    ephemeral=True,
+                )
+                return
+            ids = {winner1.id, winner2.id, loser1.id, loser2.id}
+            if len(ids) < 4:
+                await ctx.followup.send("All **four** players must be different members.", ephemeral=True)
+                return
+            for m in (winner1, winner2, loser1, loser2):
+                if not await db.get_member_entry(lb_id, m.id):
+                    await ctx.followup.send(
+                        f"**{m.display_name}** is not on this leaderboard — they must `/leaderboard add` first.",
+                        ephemeral=True,
+                    )
+                    return
 
-        ok = await db.record_match_2v2(
-            guild_id,
-            lb_id,
-            winner1.id,
-            winner2.id,
-            loser1.id,
-            loser2.id,
-            winner1_deck,
-            winner2_deck,
-            loser1_deck,
-            loser2_deck,
-            actor_id=ctx.author.id,
-        )
-        if ok:
-            await ctx.respond(
-                f"Recorded 2v2 on **{leaderboard}**: **{winner1.display_name}**/**{winner2.display_name}** "
-                f"({winner1_deck} / {winner2_deck}) defeated **{loser1.display_name}**/**{loser2.display_name}** "
-                f"({loser1_deck} / {loser2_deck}). Player ELO updated (team average); archetype AA-ELO unchanged."
+            ok = await db.record_match_2v2(
+                guild_id,
+                lb_id,
+                winner1.id,
+                winner2.id,
+                loser1.id,
+                loser2.id,
+                winner1_deck,
+                winner2_deck,
+                loser1_deck,
+                loser2_deck,
+                actor_id=ctx.author.id,
             )
-            await self.refresh_rankings_displays(guild_id, lb_id)
-        else:
-            await ctx.respond("Could not record the 2v2 match.", ephemeral=True)
+            if ok:
+                await ctx.followup.send(
+                    f"Recorded 2v2 on **{leaderboard}**: **{winner1.display_name}**/**{winner2.display_name}** "
+                    f"({winner1_deck} / {winner2_deck}) defeated **{loser1.display_name}**/**{loser2.display_name}** "
+                    f"({loser1_deck} / {loser2_deck}). Player ELO updated (team average); archetype AA-ELO unchanged."
+                )
+                await self.refresh_rankings_displays(guild_id, lb_id)
+            else:
+                await ctx.followup.send("Could not record the 2v2 match.", ephemeral=True)
+        except Exception:
+            await ctx.followup.send(
+                "Could not record this 2v2 match due to an internal error. Please try again in a few seconds.",
+                ephemeral=True,
+            )
 
     @leaderboard_group.command(name="undo", description="Undo the last leaderboard match or settings change (Mod/Admin)")
     async def leaderboard_undo(self, ctx: discord.ApplicationContext) -> None:
