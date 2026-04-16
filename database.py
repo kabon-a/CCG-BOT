@@ -996,7 +996,14 @@ async def record_match(
                 "UPDATE archetypes SET elo = elo - ?, total_aa_matches = total_aa_matches + 1 WHERE guild_id = ? AND canonical_name = ?",
                 (delta_arch, guild_id, loser_canon),
             )
-            await bump_archetype_pair_count(guild_id, winner_canon, loser_canon)
+            low, high = _ordered_archetype_pair(winner_canon, loser_canon)
+            await db.execute(
+                """
+                INSERT INTO archetype_pair_counts (guild_id, canon_a, canon_b, n) VALUES (?, ?, ?, 1)
+                ON CONFLICT(guild_id, canon_a, canon_b) DO UPDATE SET n = n + 1
+                """,
+                (guild_id, low, high),
+            )
         await db.commit()
 
     if actor_id is not None:

@@ -1,5 +1,6 @@
 """Leaderboard cog - ELO ranking for members + archetype tier list."""
 
+import logging
 from typing import Any
 
 import discord
@@ -8,6 +9,8 @@ from discord.ext import commands
 
 import database as db
 from database import AaEloSettings, EloSettings, format_elo
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_hex_color(s: str | None) -> int | None:
@@ -1096,6 +1099,7 @@ class LeaderboardCog(commands.Cog):
             else:
                 await ctx.followup.send("Could not record the match (try again).", ephemeral=True)
         except Exception:
+            logger.exception("Failed to record 1v1 match")
             await ctx.followup.send(
                 "Could not record this match due to an internal error. Please try again in a few seconds.",
                 ephemeral=True,
