@@ -289,6 +289,21 @@ async def init_db() -> None:
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_live_lb_lookup ON live_leaderboard_messages(guild_id, leaderboard_id, kind)"
         )
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS live_poll_status_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                poll_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                UNIQUE(guild_id, kind, poll_id, channel_id),
+                CHECK (kind IN ('regular', 'stage'))
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_live_poll_status_guild ON live_poll_status_messages(guild_id, kind, poll_id)"
+        )
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS archetype_pair_counts (
@@ -1233,6 +1248,57 @@ async def delete_live_rankings_for_leaderboard(guild_id: int, leaderboard_id: in
     return pairs
 
 
+async def upsert_live_poll_status(
+    guild_id: int,
+    kind: str,
+    poll_id: int,
+    channel_id: int,
+    message_id: int,
+) -> None:
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        await conn.execute(
+            """
+            INSERT INTO live_poll_status_messages (guild_id, kind, poll_id, channel_id, message_id)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, kind, poll_id, channel_id)
+            DO UPDATE SET message_id = excluded.message_id
+            """,
+            (guild_id, kind, poll_id, channel_id, message_id),
+        )
+        await conn.commit()
+
+
+async def get_live_poll_statuses(guild_id: int, kind: str, poll_id: int) -> list[tuple[int, int, int]]:
+    """Return list of (row_id, channel_id, message_id)."""
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        cur = await conn.execute(
+            """
+            SELECT id, channel_id, message_id FROM live_poll_status_messages
+            WHERE guild_id = ? AND kind = ? AND poll_id = ?
+            """,
+            (guild_id, kind, poll_id),
+        )
+        return [(r[0], r[1], r[2]) for r in await cur.fetchall()]
+
+
+async def delete_live_poll_status_row(row_id: int) -> None:
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        await conn.execute("DELETE FROM live_poll_status_messages WHERE id = ?", (row_id,))
+        await conn.commit()
+
+
+async def list_live_poll_status_targets() -> list[tuple[int, str, int]]:
+    """Return unique (guild_id, kind, poll_id) targets for periodic refresh."""
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        cur = await conn.execute(
+            """
+            SELECT DISTINCT guild_id, kind, poll_id
+            FROM live_poll_status_messages
+            """
+        )
+        return [(int(r[0]), str(r[1]), int(r[2])) for r in await cur.fetchall()]
+
+
 # --- Active users (for @active role) ---
 
 ACTIVE_WINDOW_SECONDS = 7 * 24 * 60 * 60  # 7 days
@@ -1528,6 +1594,24 @@ async def get_pending_preference_polls() -> list[dict]:
             (now,),
         )
         return [dict(r) for r in await cur.fetchall()]
+
+
+async def get_stage2_poll_for_stage(guild_id: int, stage_poll_id: int) -> dict | None:
+    """Get the reaction poll row used for Stage 2 preference, if present."""
+    suffix = f"(from stage poll #{stage_poll_id})"
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            """
+            SELECT * FROM polls
+            WHERE guild_id = ? AND title LIKE '[Stage 2] %' AND title LIKE ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (guild_id, f"%{suffix}%"),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
 
 
 # --- Auto-translate preferences ---

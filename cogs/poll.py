@@ -123,6 +123,205 @@ class PollCog(commands.Cog):
         active_eligible = [m for m in guild.members if is_eligible(m) and m.id in active_member_ids]
         return len(active_eligible), {m.id for m in active_eligible}
 
+    async def _build_regular_status_embed(self, guild: discord.Guild, poll: dict) -> discord.Embed:
+        now = discord.utils.utcnow().timestamp()
+        options = json.loads(poll["options"])
+        votes = await db.get_poll_votes(poll["id"])
+        counts = [0] * len(options)
+        unique_voters = set()
+        for uid, oi in votes:
+            unique_voters.add(uid)
+            if 0 <= oi < len(options):
+                counts[oi] += 1
+        total_votes = sum(counts)
+        n_eff = compute_n_eff(counts)
+        pwin_required = compute_pwin(n_eff) * 100.0
+        closes_in = max(0, int(float(poll["ends_at"]) - now))
+        is_open = closes_in > 0
+
+        lines = []
+        for i, opt in enumerate(options):
+            c = counts[i]
+            pct = 0.0 if total_votes == 0 else (100.0 * c / total_votes)
+            lines.append(f"{POLL_EMOJIS[i]} **{opt}** - {c} vote(s) ({pct:.1f}%)")
+
+        desc = "\n".join(lines) if lines else "*No options.*"
+        desc += (
+            f"\n\n**Status:** {'Open' if is_open else 'Closed/Pending finalize'}"
+            f"\n**Unique voters:** {len(unique_voters)}"
+            f"\n**Total votes:** {total_votes}"
+            f"\n**Simpson threshold now:** {pwin_required:.1f}% (n_eff={n_eff:.3f})"
+        )
+        if is_open:
+            desc += f"\n**Closes in:** {format_duration(closes_in)}"
+
+        return discord.Embed(
+            title=f"Poll Status: {poll['title']} (ID {poll['id']})",
+            description=desc,
+            color=0x2E86AB,
+            timestamp=discord.utils.utcnow(),
+        )
+
+    async def _build_stage_status_embed(self, stage: dict) -> discord.Embed:
+        now = discord.utils.utcnow().timestamp()
+        poll_id = int(stage["id"])
+        options = json.loads(stage["options"])
+        num_tiers = int(stage["num_tiers"])
+        status = str(stage["status"])
+        votes = await db.get_stage_votes(poll_id)
+
+        by_option = [[0] * num_tiers for _ in options]
+        unique_voters = set()
+        for uid, oi, tier in votes:
+            unique_voters.add(uid)
+            if 0 <= oi < len(options) and 1 <= tier <= num_tiers:
+                by_option[oi][tier - 1] += 1
+
+        lines = [f"**Status:** `{status}`", f"**Stage 1 unique voters:** {len(unique_voters)}"]
+        stage1_left = max(0, int(float(stage["ends_at"]) - now))
+        if status == "stage1_open":
+            lines.append(f"**Stage 1 closes in:** {format_duration(stage1_left)}")
+        pref_end = stage.get("preference_ends_at")
+        if status == "preference_open" and pref_end is not None:
+            pref_left = max(0, int(float(pref_end) - now))
+            lines.append(f"**Stage 2 closes in:** {format_duration(pref_left)}")
+        if stage.get("preference_options"):
+            try:
+                pref_idxs = json.loads(stage["preference_options"])
+                labels = ", ".join([f"`{i+1}` {options[i]}" for i in pref_idxs if 0 <= i < len(options)])
+                if labels:
+                    lines.append(f"**Preference options:** {labels}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+
+        lines.append("")
+        lines.append("**Stage 1 tier distribution by option:**")
+        for i, opt in enumerate(options):
+            tier_counts = by_option[i]
+            total = sum(tier_counts)
+            dist = ", ".join([f"T{t+1}:{tier_counts[t]}" for t in range(num_tiers)])
+            lines.append(f"`{i+1}` **{opt}** - {total} vote(s) [{dist}]")
+
+        return discord.Embed(
+            title=f"Stage Poll Status: {stage['title']} (ID {poll_id})",
+            description="\n".join(lines),
+            color=0x345995,
+            timestamp=discord.utils.utcnow(),
+        )
+
+    async def _refresh_live_status_messages(self, guild_id: int, kind: str, poll_id: int) -> None:
+        rows = await db.get_live_poll_statuses(guild_id, kind, poll_id)
+        if not rows:
+            return
+        guild = self.bot.get_guild(guild_id)
+        if not guild:
+            return
+
+        if kind == "regular":
+            poll = await db.get_poll_by_id(poll_id)
+            if not poll or int(poll["guild_id"]) != guild_id:
+                for row_id, _, _ in rows:
+                    await db.delete_live_poll_status_row(row_id)
+                return
+            embed = await self._build_regular_status_embed(guild, poll)
+        else:
+            stage = await db.get_stage_poll_by_id(poll_id)
+            if not stage or int(stage["guild_id"]) != guild_id:
+                for row_id, _, _ in rows:
+                    await db.delete_live_poll_status_row(row_id)
+                return
+            embed = await self._build_stage_status_embed(stage)
+
+        for row_id, channel_id, message_id in rows:
+            channel = guild.get_channel(channel_id)
+            if not channel or not isinstance(channel, discord.TextChannel):
+                await db.delete_live_poll_status_row(row_id)
+                continue
+            try:
+                msg = await channel.fetch_message(message_id)
+                await msg.edit(embed=embed)
+            except discord.NotFound:
+                await db.delete_live_poll_status_row(row_id)
+            except discord.HTTPException:
+                pass
+
+    async def _close_preference_and_post(
+        self,
+        guild: discord.Guild,
+        stage_poll: dict,
+        channel: discord.abc.Messageable,
+    ) -> None:
+        """Close Stage 2 preference round and post final outcome."""
+        stage_id = int(stage_poll["id"])
+        options: list[str] = json.loads(stage_poll["options"])
+        role_ids: list[int] = json.loads(stage_poll["role_ids"]) if stage_poll["role_ids"] else []
+        pref_idxs: list[int] = json.loads(stage_poll["preference_options"] or "[]")
+
+        pref_poll = await db.get_stage2_poll_for_stage(guild.id, stage_id)
+        if not pref_poll:
+            await db.set_stage_poll_status(stage_id, "failed_preference")
+            await channel.send(
+                embed=discord.Embed(
+                    title=f"📊 Stage 2 Results: {stage_poll['title']} (ID {stage_id})",
+                    description="❌ Could not locate the Stage 2 preference poll record. Marked as failed.",
+                    color=0x8B0000,
+                    timestamp=discord.utils.utcnow(),
+                )
+            )
+            return
+
+        _, eligible_ids = await self._get_active_eligible_ids(guild, role_ids)
+        pref_options = json.loads(pref_poll["options"])
+        votes = await db.get_poll_votes(int(pref_poll["id"]))
+        valid_votes = [(uid, oi) for (uid, oi) in votes if uid in eligible_ids]
+        counts = [0] * len(pref_options)
+        for _, oi in valid_votes:
+            if 0 <= oi < len(pref_options):
+                counts[oi] += 1
+
+        total_votes = sum(counts)
+        if total_votes <= 0:
+            await db.set_stage_poll_status(stage_id, "failed_preference")
+            outcome = "❌ Stage 2 closed with no valid votes. Outcome is inconclusive."
+            color = 0x8B0000
+        else:
+            max_count = max(counts)
+            winners = [i for i, c in enumerate(counts) if c == max_count]
+            if len(winners) != 1:
+                await db.set_stage_poll_status(stage_id, "failed_preference_tie")
+                labels = ", ".join([f"`{i+1}` {pref_options[i]}" for i in winners])
+                outcome = f"❌ Stage 2 tie between: {labels}. Outcome is inconclusive."
+                color = 0x8B0000
+            else:
+                w = winners[0]
+                chosen_global_idx = pref_idxs[w] if 0 <= w < len(pref_idxs) else None
+                if chosen_global_idx is None or chosen_global_idx >= len(options):
+                    await db.set_stage_poll_status(stage_id, "failed_preference")
+                    outcome = "❌ Stage 2 winner mapping failed. Outcome is inconclusive."
+                    color = 0x8B0000
+                else:
+                    await db.set_stage_poll_status(stage_id, "passed_preference")
+                    outcome = (
+                        f"✅ Final selection: option `{chosen_global_idx+1}` "
+                        f"(**{options[chosen_global_idx]}**) via Stage 2 preference."
+                    )
+                    color = 0x2E86AB
+
+        lines = []
+        for i, name in enumerate(pref_options):
+            c = counts[i]
+            pct = 0.0 if total_votes == 0 else (100.0 * c / total_votes)
+            lines.append(f"{POLL_EMOJIS[i]} **{name}** — {c} vote(s) ({pct:.1f}%)")
+
+        embed = discord.Embed(
+            title=f"📊 Stage 2 Results: {stage_poll['title']} (ID {stage_id})",
+            description="\n".join(lines + ["", outcome]),
+            color=color,
+            timestamp=discord.utils.utcnow(),
+        )
+        await channel.send(embed=embed)
+        await db.delete_poll(int(pref_poll["id"]))
+
     @poll_group.command(name="preference_create", description="Create a preference poll (reaction voting).")
     async def poll_create(
         self,
@@ -289,6 +488,7 @@ class PollCog(commands.Cog):
             return
         await db.add_stage_vote(poll_id, ctx.author.id, option_index - 1, tier)
         await grant_active_and_record(ctx.guild, ctx.author)
+        await self._refresh_live_status_messages(ctx.guild.id, "stage", poll_id)
         await ctx.respond(
             f"Recorded: option `{option_index}` ({options[option_index-1]}) -> tier `{tier}`.",
             ephemeral=True,
@@ -315,7 +515,78 @@ class PollCog(commands.Cog):
             await ctx.respond("Stage 1 is already closed for this poll.", ephemeral=True)
             return
         await self._close_stage1_and_post(ctx.guild, poll, ctx.channel)
+        await self._refresh_live_status_messages(ctx.guild.id, "stage", poll_id)
         await ctx.respond("Stage 1 closed and report posted.", ephemeral=True)
+
+    @poll_group.command(name="status", description="View current results/status for a poll ID.")
+    async def poll_status(
+        self,
+        ctx: discord.ApplicationContext,
+        poll_id: Option(int, "Poll ID", required=True),
+        live: Option(
+            bool,
+            "Post/update a persistent in-channel status message",
+            required=False,
+            default=False,
+        ),
+    ) -> None:
+        if not ctx.guild:
+            await ctx.respond("Must be used in a server.", ephemeral=True)
+            return
+
+        poll = await db.get_poll_by_id(poll_id)
+        if poll and poll["guild_id"] == ctx.guild.id:
+            embed = await self._build_regular_status_embed(ctx.guild, poll)
+            if live:
+                if not isinstance(ctx.channel, discord.TextChannel):
+                    await ctx.respond("Use live status in a server text channel.", ephemeral=True)
+                    return
+                displays = await db.get_live_poll_statuses(ctx.guild.id, "regular", poll_id)
+                existing = next((d for d in displays if d[1] == ctx.channel.id), None)
+                if existing:
+                    row_id, _, msg_id = existing
+                    try:
+                        msg = await ctx.channel.fetch_message(msg_id)
+                        await msg.edit(embed=embed)
+                    except discord.NotFound:
+                        await db.delete_live_poll_status_row(row_id)
+                        msg = await ctx.channel.send(embed=embed)
+                        await db.upsert_live_poll_status(ctx.guild.id, "regular", poll_id, ctx.channel.id, msg.id)
+                else:
+                    msg = await ctx.channel.send(embed=embed)
+                    await db.upsert_live_poll_status(ctx.guild.id, "regular", poll_id, ctx.channel.id, msg.id)
+                await ctx.respond("Live poll status posted in this channel and will auto-refresh.", ephemeral=True)
+            else:
+                await ctx.respond(embed=embed, ephemeral=True)
+            return
+
+        stage = await db.get_stage_poll_by_id(poll_id)
+        if stage and stage["guild_id"] == ctx.guild.id:
+            embed = await self._build_stage_status_embed(stage)
+            if live:
+                if not isinstance(ctx.channel, discord.TextChannel):
+                    await ctx.respond("Use live status in a server text channel.", ephemeral=True)
+                    return
+                displays = await db.get_live_poll_statuses(ctx.guild.id, "stage", poll_id)
+                existing = next((d for d in displays if d[1] == ctx.channel.id), None)
+                if existing:
+                    row_id, _, msg_id = existing
+                    try:
+                        msg = await ctx.channel.fetch_message(msg_id)
+                        await msg.edit(embed=embed)
+                    except discord.NotFound:
+                        await db.delete_live_poll_status_row(row_id)
+                        msg = await ctx.channel.send(embed=embed)
+                        await db.upsert_live_poll_status(ctx.guild.id, "stage", poll_id, ctx.channel.id, msg.id)
+                else:
+                    msg = await ctx.channel.send(embed=embed)
+                    await db.upsert_live_poll_status(ctx.guild.id, "stage", poll_id, ctx.channel.id, msg.id)
+                await ctx.respond("Live stage poll status posted in this channel and will auto-refresh.", ephemeral=True)
+            else:
+                await ctx.respond(embed=embed, ephemeral=True)
+            return
+
+        await ctx.respond(f"No poll with ID **{poll_id}** in this server.", ephemeral=True)
 
     async def _close_stage1_and_post(
         self,
@@ -495,6 +766,7 @@ class PollCog(commands.Cog):
                 except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                     pass
         await db.delete_poll(poll_id)
+        await self._refresh_live_status_messages(ctx.guild.id, "regular", poll_id)
         await ctx.respond(f"Poll **{poll_id}** removed from the bot.", ephemeral=True)
 
     @commands.Cog.listener()
@@ -528,12 +800,18 @@ class PollCog(commands.Cog):
                 await grant_active_and_record(guild, user)
         else:
             await db.remove_poll_vote(poll["id"], payload.user_id, option_index)
+        if payload.guild_id:
+            await self._refresh_live_status_messages(payload.guild_id, "regular", int(poll["id"]))
 
     @tasks.loop(seconds=30)
     async def check_poll_closures(self) -> None:
         pending = await db.get_pending_polls()
         for poll in pending:
+            if str(poll.get("title", "")).startswith("[Stage 2] "):
+                # Stage 2 reactions are finalized via pending_preference stage-poll rows.
+                continue
             await self._close_poll(poll)
+            await self._refresh_live_status_messages(int(poll["guild_id"]), "regular", int(poll["id"]))
             await db.delete_poll(poll["id"])
         pending_stage1 = await db.get_pending_stage1_polls()
         for poll in pending_stage1:
@@ -541,9 +819,33 @@ class PollCog(commands.Cog):
             if not guild:
                 continue
             channel = guild.get_channel(poll["channel_id"])
+            if not channel:
+                try:
+                    channel = await guild.fetch_channel(poll["channel_id"])
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    continue
             if not channel or not isinstance(channel, discord.TextChannel):
                 continue
             await self._close_stage1_and_post(guild, poll, channel)
+            await self._refresh_live_status_messages(int(poll["guild_id"]), "stage", int(poll["id"]))
+        pending_pref = await db.get_pending_preference_polls()
+        for poll in pending_pref:
+            guild = self.bot.get_guild(poll["guild_id"])
+            if not guild:
+                continue
+            channel = guild.get_channel(poll["channel_id"])
+            if not channel:
+                try:
+                    channel = await guild.fetch_channel(poll["channel_id"])
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    continue
+            if not channel or not isinstance(channel, discord.TextChannel):
+                continue
+            await self._close_preference_and_post(guild, poll, channel)
+            await self._refresh_live_status_messages(int(poll["guild_id"]), "stage", int(poll["id"]))
+        # Periodic refresh keeps countdown/status boards live even without new votes.
+        for guild_id, kind, poll_id in await db.list_live_poll_status_targets():
+            await self._refresh_live_status_messages(guild_id, kind, poll_id)
 
     async def _close_poll(self, poll: dict) -> None:
         guild = self.bot.get_guild(poll["guild_id"])
