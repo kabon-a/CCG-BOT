@@ -1006,6 +1006,37 @@ class LeaderboardCog(commands.Cog):
         else:
             await ctx.respond(f"You are already on **{leaderboard}**.", ephemeral=True)
 
+    @leaderboard_group.command(name="add_member", description="Add a member to a leaderboard (Mod/Admin only)")
+    async def add_member_admin(
+        self,
+        ctx: discord.ApplicationContext,
+        leaderboard: Option(str, "Leaderboard name", required=True, autocomplete=leaderboard_autocomplete),
+        member: Option(discord.Member, "Member to add", required=True),
+        display_name: Option(str, "Optional display name override", required=False),
+    ) -> None:
+        guild_id = ctx.guild.id if ctx.guild else 0
+        if not ctx.guild or not ctx.author:
+            await ctx.respond("Must be used in a server.", ephemeral=True)
+            return
+        if not _mod_perms(ctx.author):
+            await ctx.respond("You need **Moderator** or **Administrator** permissions.", ephemeral=True)
+            return
+        lb_id = await db.get_leaderboard_id(guild_id, _parse_leaderboard_name_from_autocomplete(leaderboard))
+        if not lb_id:
+            await ctx.respond(f"No leaderboard named **{leaderboard}**.", ephemeral=True)
+            return
+        ok = await db.add_member(lb_id, member.id, display_name)
+        if ok:
+            settings = await db.get_leaderboard_settings(lb_id)
+            shown = display_name or member.display_name
+            await ctx.respond(
+                f"Added **{shown}** to **{leaderboard}** with starting ELO "
+                f"{format_elo(settings.default_rating, settings.precision)}."
+            )
+            await self.refresh_rankings_displays(guild_id, lb_id)
+        else:
+            await ctx.respond(f"**{member.display_name}** is already on **{leaderboard}**.", ephemeral=True)
+
     @leaderboard_group.command(name="match", description="Record a match (winner vs loser, with deck names)")
     async def match(
         self,
