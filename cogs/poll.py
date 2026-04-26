@@ -254,7 +254,6 @@ class PollCog(commands.Cog):
         """Close Stage 2 preference round and post final outcome."""
         stage_id = int(stage_poll["id"])
         options: list[str] = json.loads(stage_poll["options"])
-        role_ids: list[int] = json.loads(stage_poll["role_ids"]) if stage_poll["role_ids"] else []
         pref_idxs: list[int] = json.loads(stage_poll["preference_options"] or "[]")
 
         pref_poll = await db.get_stage2_poll_for_stage(guild.id, stage_id)
@@ -270,10 +269,10 @@ class PollCog(commands.Cog):
             )
             return
 
-        _, eligible_ids = await self._get_active_eligible_ids(guild, role_ids)
         pref_options = json.loads(pref_poll["options"])
         votes = await db.get_poll_votes(int(pref_poll["id"]))
-        valid_votes = [(uid, oi) for (uid, oi) in votes if uid in eligible_ids]
+        # Stage 2 preference is intentionally open to everyone in the server.
+        valid_votes = votes
         counts = [0] * len(pref_options)
         for _, oi in valid_votes:
             if 0 <= oi < len(pref_options):
@@ -598,21 +597,42 @@ class PollCog(commands.Cog):
         options: list[str] = json.loads(poll["options"])
         role_ids: list[int] = json.loads(poll["role_ids"]) if poll["role_ids"] else []
         num_tiers = int(poll["num_tiers"])
-        _, eligible_ids = await self._get_active_eligible_ids(guild, role_ids)
+        num_active_eligible, eligible_ids = await self._get_active_eligible_ids(guild, role_ids)
         votes = await db.get_stage_votes(poll_id)
         valid_votes = [(u, oi, t) for (u, oi, t) in votes if u in eligible_ids]
+        min_unique_voters_required = QUORUM_PERCENT * num_active_eligible
 
         assignments: list[int | None] = []
         report_lines: list[str] = []
+        option_quorum_failed = False
+        quorum_fail_lines: list[str] = []
 
         for oi, opt in enumerate(options):
             tier_counts = [0] * num_tiers
             option_tiers: list[int] = []
+            option_voter_ids: set[int] = set()
             for _, vote_opt, tier in valid_votes:
                 if vote_opt == oi and 1 <= tier <= num_tiers:
                     tier_counts[tier - 1] += 1
                     option_tiers.append(tier)
+            for uid, vote_opt, _ in valid_votes:
+                if vote_opt == oi:
+                    option_voter_ids.add(uid)
+            unique_option_voters = len(option_voter_ids)
+            quorum_met_for_option = unique_option_voters >= min_unique_voters_required
             total_opt_votes = len(option_tiers)
+            if not quorum_met_for_option:
+                option_quorum_failed = True
+                assignments.append(None)
+                quorum_fail_lines.append(
+                    f"`{oi+1}` {opt}: {unique_option_voters} unique eligible voter(s) "
+                    f"< required {math.ceil(min_unique_voters_required)}"
+                )
+                report_lines.append(
+                    f"**{oi+1}. {opt}** — inconclusive (unique eligible voters {unique_option_voters}/"
+                    f"{num_active_eligible}; need at least {math.ceil(min_unique_voters_required)})"
+                )
+                continue
             if total_opt_votes == 0:
                 assignments.append(None)
                 report_lines.append(f"**{oi+1}. {opt}** — inconclusive (no votes)")
@@ -646,7 +666,18 @@ class PollCog(commands.Cog):
         t1_idxs = [i for i, t in enumerate(assignments) if t == 1]
         assigned_only = [t for t in assignments if t is not None]
 
-        if not assigned_only:
+        if option_quorum_failed:
+            attempts = int(poll["attempts"]) + 1
+            new_status = "annulled" if attempts >= 3 else "failed_stage1"
+            await db.set_stage_poll_status(poll_id, new_status, attempts=attempts)
+            outcome = (
+                "❌ Stage 1 inconclusive: one or more options did not meet the minimum unique-voter threshold "
+                f"({QUORUM_PERCENT * 100:.0f}% of active eligible voters).\n"
+                + "\n".join(quorum_fail_lines)
+                + "\n"
+                + ("Proposal annulled after 3 failures." if attempts >= 3 else "Proposal should be rescheduled.")
+            )
+        elif not assigned_only:
             attempts = int(poll["attempts"]) + 1
             new_status = "annulled" if attempts >= 3 else "failed_stage1"
             await db.set_stage_poll_status(poll_id, new_status, attempts=attempts)
@@ -675,7 +706,7 @@ class PollCog(commands.Cog):
                 message_id=pref_msg.id,
                 title=f"[Stage 2] {poll['title']} (from stage poll #{poll_id})",
                 options=pref_options,
-                role_ids=role_ids,
+                role_ids=[],
                 duration_seconds=pref_secs,
             )
             await db.set_stage_poll_status(poll_id, "preference_open", preference_options=t1_idxs)
@@ -712,7 +743,7 @@ class PollCog(commands.Cog):
                     message_id=pref_msg.id,
                     title=f"[Stage 2] {poll['title']} (from stage poll #{poll_id})",
                     options=pref_options,
-                    role_ids=role_ids,
+                    role_ids=[],
                     duration_seconds=pref_secs,
                 )
                 await db.set_stage_poll_status(poll_id, "preference_open", preference_options=min_idxs)
