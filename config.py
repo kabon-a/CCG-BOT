@@ -18,3 +18,9 @@ else:
 
 DEFAULT_ELO = 1000
 K_FACTOR = 32  # Standard ELO sensitivity
+
+# Interspace integration — set both in Railway / .env on the bot host.
+# INTERSPACE_URL: the Railway backend URL, e.g. https://review-system-production.up.railway.app
+# INTERSPACE_BOT_SECRET: must match the BOT_SECRET env var on the Interspace backend.
+INTERSPACE_URL = os.getenv("INTERSPACE_URL", "").rstrip("/")
+INTERSPACE_BOT_SECRET = os.getenv("INTERSPACE_BOT_SECRET", "")

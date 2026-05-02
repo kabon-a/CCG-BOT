@@ -1,25 +1,38 @@
-"""Poll cog - Courtroom voting system with Simpson-based thresholds."""
+"""Poll cog — Courtroom voting via Interspace web UI.
+
+Stage 1 tier assignments are submitted through the Interspace frontend.
+This cog handles:
+  - /poll stage_create  → registers the poll with Interspace, posts announcement.
+  - /poll stage_close   → manually triggers result computation on Interspace.
+  - /poll status        → shows current poll results.
+  - /poll delete        → removes a poll.
+  - /poll preference_create → unchanged simple reaction poll (no Interspace).
+  - Background task     → auto-closes expired polls; fetches results from Interspace.
+
+Removed: /poll stage_vote (voting is now done on the Interspace web UI).
+"""
 
 import json
 import math
 import re
 from statistics import mean
 
+import aiohttp
 import discord
 from discord import Option
 from discord.ext import commands, tasks
 
 import database as db
 from cogs.active import grant_active_and_record
+from config import INTERSPACE_URL, INTERSPACE_BOT_SECRET
 
 POLL_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 EMOJI_TO_INDEX = {e: i for i, e in enumerate(POLL_EMOJIS)}
 ACTIVE_ROLE_NAME = "active"
-QUORUM_PERCENT = 0.65  # 65% of active eligible must vote
+QUORUM_PERCENT = 0.65
 
 
 def parse_duration(s: str) -> int | None:
-    """Parse duration string like 1d, 24h, 60m into seconds. Returns None if invalid."""
     s = s.strip().lower()
     m = re.match(r"^(\d+)\s*(d|h|m|s)?$", s)
     if not m:
@@ -31,57 +44,15 @@ def parse_duration(s: str) -> int | None:
 
 
 def compute_n_eff(vote_counts: list[int]) -> float:
-    """Inverse Simpson effective options: n_eff = 1 / sum(p_i^2)."""
     total = sum(vote_counts)
     if total <= 0:
         return 1.0
-    simpson_d = 0.0
-    for c in vote_counts:
-        if c > 0:
-            p = c / total
-            simpson_d += p * p
-    if simpson_d <= 0:
-        return 1.0
-    return 1.0 / simpson_d
+    simpson_d = sum((c / total) ** 2 for c in vote_counts if c > 0)
+    return 1.0 / simpson_d if simpson_d > 0 else 1.0
 
 
 def compute_pwin(n_eff: float) -> float:
-    """Winning vote percentage required: Pwin = 1.5 / (n_eff + 0.5)."""
     return 1.5 / (n_eff + 0.5)
-
-
-def compute_option_pwin_from_tiers(tier_counts: list[int]) -> tuple[float, float]:
-    """Return (n_eff, p_win) for an option's tier distribution."""
-    n_eff = compute_n_eff(tier_counts)
-    return n_eff, compute_pwin(n_eff)
-
-
-def expected_value_and_ci_90(tier_counts: list[int]) -> tuple[float, float, float]:
-    """Return (ev, ci_low, ci_high)."""
-    n = sum(tier_counts)
-    if n <= 0:
-        return (0.0, 0.0, 0.0)
-    values: list[int] = []
-    for idx, c in enumerate(tier_counts, 1):
-        values.extend([idx] * c)
-    ev = mean(values)
-    var = sum((v - ev) ** 2 for v in values) / n
-    sigma = math.sqrt(var)
-    se = sigma / math.sqrt(n)
-    margin = 1.645 * se
-    return (ev, ev - margin, ev + margin)
-
-
-def ci_to_tier(ci_low: float, ci_high: float, num_tiers: int) -> int | None:
-    """Accept assignment only if full CI lies inside one tier bucket."""
-    for t in range(1, num_tiers + 1):
-        lower = float("-inf") if t == 1 else (t - 0.5)
-        upper = float("inf") if t == num_tiers else (t + 0.5)
-        if ci_low > lower and ci_high <= upper:
-            return t
-        if t == 1 and ci_high <= upper:
-            return t
-    return None
 
 
 def format_duration(seconds: int) -> str:
@@ -94,12 +65,52 @@ def format_duration(seconds: int) -> str:
     return f"{seconds}s"
 
 
+def _interspace_headers() -> dict:
+    return {"x-bot-secret": INTERSPACE_BOT_SECRET, "Content-Type": "application/json"}
+
+
+async def _interspace_post(path: str, payload: dict) -> dict | None:
+    """POST to Interspace backend. Returns parsed JSON or None on failure."""
+    if not INTERSPACE_URL or not INTERSPACE_BOT_SECRET:
+        return None
+    url = f"{INTERSPACE_URL}{path}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=_interspace_headers(), timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status in (200, 201):
+                    return await resp.json()
+                text = await resp.text()
+                print(f"[Interspace] POST {path} → {resp.status}: {text[:200]}")
+                return None
+    except Exception as exc:
+        print(f"[Interspace] POST {path} failed: {exc}")
+        return None
+
+
+async def _interspace_post_compute(path: str) -> dict | None:
+    """POST (no body) to Interspace compute endpoint."""
+    if not INTERSPACE_URL or not INTERSPACE_BOT_SECRET:
+        return None
+    url = f"{INTERSPACE_URL}{path}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=_interspace_headers(), timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status in (200, 201):
+                    return await resp.json()
+                text = await resp.text()
+                print(f"[Interspace] POST {path} → {resp.status}: {text[:200]}")
+                return None
+    except Exception as exc:
+        print(f"[Interspace] POST {path} failed: {exc}")
+        return None
+
+
 def setup(bot: commands.Bot) -> None:
     bot.add_cog(PollCog(bot))
 
 
 class PollCog(commands.Cog):
-    """Courtroom-style polls with Simpson-based thresholds."""
+    """Courtroom-style polls with Interspace web voting."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -128,7 +139,7 @@ class PollCog(commands.Cog):
         options = json.loads(poll["options"])
         votes = await db.get_poll_votes(poll["id"])
         counts = [0] * len(options)
-        unique_voters = set()
+        unique_voters: set = set()
         for uid, oi in votes:
             unique_voters.add(uid)
             if 0 <= oi < len(options):
@@ -171,36 +182,21 @@ class PollCog(commands.Cog):
         votes = await db.get_stage_votes(poll_id)
 
         by_option = [[0] * num_tiers for _ in options]
-        unique_voters = set()
+        unique_voters: set = set()
         for uid, oi, tier in votes:
             unique_voters.add(uid)
             if 0 <= oi < len(options) and 1 <= tier <= num_tiers:
                 by_option[oi][tier - 1] += 1
 
-        lines = [f"**Status:** `{status}`", f"**Stage 1 unique voters:** {len(unique_voters)}"]
+        lines = [f"**Status:** `{status}`", f"**Stage 1 unique voters (Interspace):** {len(unique_voters)}"]
         stage1_left = max(0, int(float(stage["ends_at"]) - now))
         if status == "stage1_open":
             lines.append(f"**Stage 1 closes in:** {format_duration(stage1_left)}")
-        pref_end = stage.get("preference_ends_at")
-        if status == "preference_open" and pref_end is not None:
-            pref_left = max(0, int(float(pref_end) - now))
-            lines.append(f"**Stage 2 closes in:** {format_duration(pref_left)}")
-        if stage.get("preference_options"):
-            try:
-                pref_idxs = json.loads(stage["preference_options"])
-                labels = ", ".join([f"`{i+1}` {options[i]}" for i in pref_idxs if 0 <= i < len(options)])
-                if labels:
-                    lines.append(f"**Preference options:** {labels}")
-            except (TypeError, ValueError, json.JSONDecodeError):
-                pass
 
         lines.append("")
-        lines.append("**Stage 1 tier distribution by option:**")
-        for i, opt in enumerate(options):
-            tier_counts = by_option[i]
-            total = sum(tier_counts)
-            dist = ", ".join([f"T{t+1}:{tier_counts[t]}" for t in range(num_tiers)])
-            lines.append(f"`{i+1}` **{opt}** - {total} vote(s) [{dist}]")
+        lines.append("**Voting is done via the Interspace web UI.**")
+        if INTERSPACE_URL:
+            lines.append(f"🔗 {INTERSPACE_URL}")
 
         return discord.Embed(
             title=f"Stage Poll Status: {stage['title']} (ID {poll_id})",
@@ -245,94 +241,14 @@ class PollCog(commands.Cog):
             except discord.HTTPException:
                 pass
 
-    async def _close_preference_and_post(
-        self,
-        guild: discord.Guild,
-        stage_poll: dict,
-        channel: discord.abc.Messageable,
-    ) -> None:
-        """Close Stage 2 preference round and post final outcome."""
-        stage_id = int(stage_poll["id"])
-        options: list[str] = json.loads(stage_poll["options"])
-        pref_idxs: list[int] = json.loads(stage_poll["preference_options"] or "[]")
-
-        pref_poll = await db.get_stage2_poll_for_stage(guild.id, stage_id)
-        if not pref_poll:
-            await db.set_stage_poll_status(stage_id, "failed_preference")
-            await channel.send(
-                embed=discord.Embed(
-                    title=f"📊 Stage 2 Results: {stage_poll['title']} (ID {stage_id})",
-                    description="❌ Could not locate the Stage 2 preference poll record. Marked as failed.",
-                    color=0x8B0000,
-                    timestamp=discord.utils.utcnow(),
-                )
-            )
-            return
-
-        pref_options = json.loads(pref_poll["options"])
-        votes = await db.get_poll_votes(int(pref_poll["id"]))
-        # Stage 2 preference is intentionally open to everyone in the server.
-        valid_votes = votes
-        counts = [0] * len(pref_options)
-        for _, oi in valid_votes:
-            if 0 <= oi < len(pref_options):
-                counts[oi] += 1
-
-        total_votes = sum(counts)
-        if total_votes <= 0:
-            await db.set_stage_poll_status(stage_id, "failed_preference")
-            outcome = "❌ Stage 2 closed with no valid votes. Outcome is inconclusive."
-            color = 0x8B0000
-        else:
-            max_count = max(counts)
-            winners = [i for i, c in enumerate(counts) if c == max_count]
-            if len(winners) != 1:
-                await db.set_stage_poll_status(stage_id, "failed_preference_tie")
-                labels = ", ".join([f"`{i+1}` {pref_options[i]}" for i in winners])
-                outcome = f"❌ Stage 2 tie between: {labels}. Outcome is inconclusive."
-                color = 0x8B0000
-            else:
-                w = winners[0]
-                chosen_global_idx = pref_idxs[w] if 0 <= w < len(pref_idxs) else None
-                if chosen_global_idx is None or chosen_global_idx >= len(options):
-                    await db.set_stage_poll_status(stage_id, "failed_preference")
-                    outcome = "❌ Stage 2 winner mapping failed. Outcome is inconclusive."
-                    color = 0x8B0000
-                else:
-                    await db.set_stage_poll_status(stage_id, "passed_preference")
-                    outcome = (
-                        f"✅ Final selection: option `{chosen_global_idx+1}` "
-                        f"(**{options[chosen_global_idx]}**) via Stage 2 preference."
-                    )
-                    color = 0x2E86AB
-
-        lines = []
-        for i, name in enumerate(pref_options):
-            c = counts[i]
-            pct = 0.0 if total_votes == 0 else (100.0 * c / total_votes)
-            lines.append(f"{POLL_EMOJIS[i]} **{name}** — {c} vote(s) ({pct:.1f}%)")
-
-        embed = discord.Embed(
-            title=f"📊 Stage 2 Results: {stage_poll['title']} (ID {stage_id})",
-            description="\n".join(lines + ["", outcome]),
-            color=color,
-            timestamp=discord.utils.utcnow(),
-        )
-        await channel.send(embed=embed)
-        await db.delete_poll(int(pref_poll["id"]))
-
     @poll_group.command(name="preference_create", description="Create a preference poll (reaction voting).")
     async def poll_create(
         self,
         ctx: discord.ApplicationContext,
         title: Option(str, "Poll title", required=True),
-        options: Option(str, "Comma-separated options (e.g. Yes, No, Abstain)", required=True),
+        options: Option(str, "Comma-separated options", required=True),
         duration: Option(str, "Duration: 1d, 24h, 60m, etc.", required=True),
-        roles: Option(
-            str,
-            "Role names that can vote, comma-separated. Leave empty for everyone.",
-            required=False,
-        ) = None,
+        roles: Option(str, "Role names that can vote, comma-separated. Empty = everyone.", required=False) = None,
     ) -> None:
         if not ctx.guild or not ctx.author:
             await ctx.respond("Must be used in a server.", ephemeral=True)
@@ -368,7 +284,7 @@ class PollCog(commands.Cog):
             color=0x2E86AB,
             timestamp=discord.utils.utcnow(),
         )
-        embed.set_footer(text=f"Closes in {format_duration(dur_sec)} • React to vote (multiple allowed)")
+        embed.set_footer(text=f"Closes in {format_duration(dur_sec)} • React to vote")
         msg = await ctx.channel.send(embed=embed)
         for i in range(len(opts)):
             await msg.add_reaction(POLL_EMOJIS[i])
@@ -384,7 +300,7 @@ class PollCog(commands.Cog):
         )
         await ctx.respond(f"Poll created. ID: {poll_id}", ephemeral=True)
 
-    @poll_group.command(name="stage_create", description="Create a two-stage tier poll (Simpson + EV fallback).")
+    @poll_group.command(name="stage_create", description="Create a two-stage tier poll (voting via Interspace).")
     async def stage_create(
         self,
         ctx: discord.ApplicationContext,
@@ -392,12 +308,14 @@ class PollCog(commands.Cog):
         options: Option(str, "Comma-separated options", required=True),
         duration: Option(str, "Stage 1 duration (e.g. 1d, 24h, 60m)", required=True),
         preference_duration: Option(str, "Stage 2 preference duration if needed", required=True),
-        num_tiers: Option(int, "Number of tiers allowed (n tiers)", required=True),
-        roles: Option(
-            str,
-            "Role names that can vote, comma-separated. Leave empty for everyone.",
+        num_tiers: Option(int, "Number of tiers (n tiers)", required=True),
+        proposal_type: Option(
+            str, "Proposal category shown on Interspace",
+            choices=["banlist", "errata", "format", "card_request"],
             required=False,
-        ) = None,
+        ) = "format",
+        proposal_text: Option(str, "Proposal description shown on Interspace", required=False) = "",
+        roles: Option(str, "Role names that can vote, comma-separated. Empty = everyone.", required=False) = None,
     ) -> None:
         if not ctx.guild or not ctx.author:
             await ctx.respond("Must be used in a server.", ephemeral=True)
@@ -425,6 +343,8 @@ class PollCog(commands.Cog):
                     await ctx.respond(f"Role **{rname}** not found.", ephemeral=True)
                     return
                 role_ids.append(role.id)
+
+        # Create poll in local bot DB first
         poll_id = await db.create_stage_poll(
             guild_id=ctx.guild.id,
             channel_id=ctx.channel.id,
@@ -435,14 +355,45 @@ class PollCog(commands.Cog):
             duration_seconds=dur_sec,
             preference_duration_seconds=pref_dur_sec,
         )
+
+        # Register poll on Interspace so users can vote via the web UI
+        import time
+        closes_at_iso = None
+        try:
+            import datetime
+            closes_at_iso = (datetime.datetime.utcnow() + datetime.timedelta(seconds=dur_sec)).isoformat() + "Z"
+        except Exception:
+            pass
+
+        interspace_result = await _interspace_post("/api/polls/open", {
+            "botPollId": poll_id,
+            "guildId": ctx.guild.id,
+            "channelId": ctx.channel.id,
+            "title": title,
+            "proposalType": proposal_type,
+            "proposalText": proposal_text,
+            "options": opts,
+            "numTiers": num_tiers,
+            "roleIds": role_ids,
+            "closesAt": closes_at_iso,
+            "preferenceDurationSeconds": pref_dur_sec,
+        })
+
+        interspace_note = ""
+        if INTERSPACE_URL:
+            if interspace_result:
+                interspace_note = f"\n\n🌐 **Vote on Interspace:** {INTERSPACE_URL}"
+            else:
+                interspace_note = "\n\n⚠️ Interspace registration failed — voting may not be available on web."
+
         opt_lines = "\n".join([f"`{i+1}`. {opt}" for i, opt in enumerate(opts)])
         embed = discord.Embed(
             title=f"⚖️ Stage 1 Open: {title}",
             description=(
                 f"**Poll ID:** `{poll_id}`\n"
                 f"**Tier range:** 1 to {num_tiers} (1 = most balanced)\n\n"
-                f"**Options:**\n{opt_lines}\n\n"
-                "Vote with `/poll stage_vote poll_id:<id> option_index:<n> tier:<n>`."
+                f"**Options:**\n{opt_lines}"
+                f"{interspace_note}"
             ),
             color=0x345995,
             timestamp=discord.utils.utcnow(),
@@ -450,50 +401,13 @@ class PollCog(commands.Cog):
         embed.set_footer(
             text=(
                 f"Stage 1 closes in {format_duration(dur_sec)} • "
-                f"If Stage 2 opens, it auto-closes in {format_duration(pref_dur_sec)}"
+                f"Voting is done via the Interspace web UI"
             )
         )
         await ctx.channel.send(embed=embed)
         await ctx.respond(f"Two-stage poll created with ID `{poll_id}`.", ephemeral=True)
 
-    @poll_group.command(name="stage_vote", description="Submit/replace your Stage 1 tier input for an option.")
-    async def stage_vote(
-        self,
-        ctx: discord.ApplicationContext,
-        poll_id: Option(int, "Stage poll ID", required=True),
-        option_index: Option(int, "Option number (1-based)", required=True),
-        tier: Option(int, "Tier value (1..num_tiers)", required=True),
-    ) -> None:
-        if not ctx.guild or not ctx.author:
-            await ctx.respond("Must be used in a server.", ephemeral=True)
-            return
-        poll = await db.get_stage_poll_by_id(poll_id)
-        if not poll or poll["guild_id"] != ctx.guild.id:
-            await ctx.respond("Stage poll not found in this server.", ephemeral=True)
-            return
-        if poll["status"] != "stage1_open":
-            await ctx.respond("Stage 1 is not open for this poll.", ephemeral=True)
-            return
-        options = json.loads(poll["options"])
-        if option_index < 1 or option_index > len(options):
-            await ctx.respond(f"option_index must be between 1 and {len(options)}.", ephemeral=True)
-            return
-        if tier < 1 or tier > int(poll["num_tiers"]):
-            await ctx.respond(f"tier must be between 1 and {poll['num_tiers']}.", ephemeral=True)
-            return
-        role_ids: list[int] = json.loads(poll["role_ids"]) if poll["role_ids"] else []
-        if role_ids and not any(r.id in role_ids for r in ctx.author.roles):
-            await ctx.respond("You are not eligible to vote on this poll.", ephemeral=True)
-            return
-        await db.add_stage_vote(poll_id, ctx.author.id, option_index - 1, tier)
-        await grant_active_and_record(ctx.guild, ctx.author)
-        await self._refresh_live_status_messages(ctx.guild.id, "stage", poll_id)
-        await ctx.respond(
-            f"Recorded: option `{option_index}` ({options[option_index-1]}) -> tier `{tier}`.",
-            ephemeral=True,
-        )
-
-    @poll_group.command(name="stage_close", description="Close Stage 1 and compute assignments/outcome.")
+    @poll_group.command(name="stage_close", description="Close Stage 1 and fetch/post results from Interspace.")
     async def stage_close(
         self,
         ctx: discord.ApplicationContext,
@@ -517,17 +431,120 @@ class PollCog(commands.Cog):
         await self._refresh_live_status_messages(ctx.guild.id, "stage", poll_id)
         await ctx.respond("Stage 1 closed and report posted.", ephemeral=True)
 
+    async def _close_stage1_and_post(
+        self,
+        guild: discord.Guild,
+        poll: dict,
+        channel: discord.abc.Messageable,
+    ) -> None:
+        poll_id = int(poll["id"])
+        options: list[str] = json.loads(poll["options"])
+
+        # Ask Interspace to compute the Stage 1 result from locked Interspace votes
+        interspace_id = f"stage-{poll_id}"
+        result = await _interspace_post_compute(f"/api/polls/{interspace_id}/compute")
+
+        if result is None:
+            # Interspace unreachable — mark poll failed locally and post an error
+            await db.set_stage_poll_status(poll_id, "failed_stage1")
+            embed = discord.Embed(
+                title=f"📊 Stage 1 Results: {poll['title']} (ID {poll_id})",
+                description="❌ Could not reach Interspace to compute results. Poll marked as failed.",
+                color=0x8B0000,
+                timestamp=discord.utils.utcnow(),
+            )
+            await channel.send(embed=embed)
+            return
+
+        # Build Discord embed from Interspace result
+        report_lines_raw = result.get("reportLines", [])
+        report_lines: list[str] = []
+        for r in report_lines_raw:
+            opt = r.get("option", "?")
+            res = r.get("result", "")
+            tier = r.get("assignedTier")
+            if tier:
+                if res == "simpson":
+                    report_lines.append(
+                        f"**{opt}** → Tier {tier} via Simpson "
+                        f"(mode {r.get('modeFreqPct')}% ≥ {r.get('pWinPct')}%, n_eff={r.get('nEff')})"
+                    )
+                else:
+                    report_lines.append(
+                        f"**{opt}** → Tier {tier} via EV fallback "
+                        f"(E={r.get('ev')}, CI90=({r.get('ciLow')}, {r.get('ciHigh')}))"
+                    )
+            else:
+                report_lines.append(f"**{opt}** → inconclusive ({r.get('reason', res)})")
+
+        outcome = result.get("outcome", "")
+        needs_stage2 = result.get("needsStage2", False)
+        new_status = result.get("status", "failed_stage1")
+
+        await db.set_stage_poll_status(poll_id, new_status)
+
+        report_text = "\n".join(report_lines)
+        embed = discord.Embed(
+            title=f"📊 Stage 1 Results: {poll['title']} (ID {poll_id})",
+            description=f"{report_text}\n\n{outcome}",
+            color=0x2E86AB if "passed" in new_status or "preference" in new_status else 0x8B0000,
+            timestamp=discord.utils.utcnow(),
+        )
+        if needs_stage2 and INTERSPACE_URL:
+            embed.add_field(
+                name="Stage 2 Voting",
+                value=f"🌐 Cast your Stage 2 preference at: {INTERSPACE_URL}",
+                inline=False,
+            )
+        await channel.send(embed=embed)
+
+        if needs_stage2:
+            pref_closes_at = result.get("preferenceClosesAt")
+            await db.set_stage_poll_status(poll_id, "preference_open",
+                                           preference_options=result.get("stage2OptionIndices", []))
+
+    async def _close_preference_and_post(
+        self,
+        guild: discord.Guild,
+        stage_poll: dict,
+        channel: discord.abc.Messageable,
+    ) -> None:
+        stage_id = int(stage_poll["id"])
+        interspace_id = f"stage-{stage_id}"
+        result = await _interspace_post_compute(f"/api/polls/{interspace_id}/compute-preference")
+
+        if result is None:
+            await db.set_stage_poll_status(stage_id, "failed_preference")
+            embed = discord.Embed(
+                title=f"📊 Stage 2 Results: {stage_poll['title']} (ID {stage_id})",
+                description="❌ Could not reach Interspace to compute Stage 2 results.",
+                color=0x8B0000,
+                timestamp=discord.utils.utcnow(),
+            )
+            await channel.send(embed=embed)
+            return
+
+        outcome = result.get("outcome", "")
+        new_status = result.get("status", "failed_preference")
+        await db.set_stage_poll_status(stage_id, new_status)
+
+        counts_data = result.get("counts", [])
+        lines = [f"**{item['option']}** — {item['count']} vote(s)" for item in counts_data]
+
+        embed = discord.Embed(
+            title=f"📊 Stage 2 Results: {stage_poll['title']} (ID {stage_id})",
+            description="\n".join(lines + ["", outcome]),
+            color=0x2E86AB if "passed" in new_status else 0x8B0000,
+            timestamp=discord.utils.utcnow(),
+        )
+        await channel.send(embed=embed)
+
     @poll_group.command(name="status", description="View current results/status for a poll ID.")
     async def poll_status(
         self,
         ctx: discord.ApplicationContext,
         poll_id: Option(int, "Poll ID", required=True),
-        live: Option(
-            bool,
-            "Post/update a persistent in-channel status message",
-            required=False,
-            default=False,
-        ),
+        live: Option(bool, "Post/update a persistent in-channel status message", required=False, default=False),
     ) -> None:
         if not ctx.guild:
             await ctx.respond("Must be used in a server.", ephemeral=True)
@@ -554,7 +571,7 @@ class PollCog(commands.Cog):
                 else:
                     msg = await ctx.channel.send(embed=embed)
                     await db.upsert_live_poll_status(ctx.guild.id, "regular", poll_id, ctx.channel.id, msg.id)
-                await ctx.respond("Live poll status posted in this channel and will auto-refresh.", ephemeral=True)
+                await ctx.respond("Live poll status posted.", ephemeral=True)
             else:
                 await ctx.respond(embed=embed, ephemeral=True)
             return
@@ -580,201 +597,19 @@ class PollCog(commands.Cog):
                 else:
                     msg = await ctx.channel.send(embed=embed)
                     await db.upsert_live_poll_status(ctx.guild.id, "stage", poll_id, ctx.channel.id, msg.id)
-                await ctx.respond("Live stage poll status posted in this channel and will auto-refresh.", ephemeral=True)
+                await ctx.respond("Live stage poll status posted.", ephemeral=True)
             else:
                 await ctx.respond(embed=embed, ephemeral=True)
             return
 
         await ctx.respond(f"No poll with ID **{poll_id}** in this server.", ephemeral=True)
 
-    async def _close_stage1_and_post(
-        self,
-        guild: discord.Guild,
-        poll: dict,
-        channel: discord.abc.Messageable,
-    ) -> None:
-        poll_id = int(poll["id"])
-        options: list[str] = json.loads(poll["options"])
-        role_ids: list[int] = json.loads(poll["role_ids"]) if poll["role_ids"] else []
-        num_tiers = int(poll["num_tiers"])
-        num_active_eligible, eligible_ids = await self._get_active_eligible_ids(guild, role_ids)
-        votes = await db.get_stage_votes(poll_id)
-        valid_votes = [(u, oi, t) for (u, oi, t) in votes if u in eligible_ids]
-        min_unique_voters_required = QUORUM_PERCENT * num_active_eligible
-
-        assignments: list[int | None] = []
-        report_lines: list[str] = []
-        option_quorum_failed = False
-        quorum_fail_lines: list[str] = []
-
-        for oi, opt in enumerate(options):
-            tier_counts = [0] * num_tiers
-            option_tiers: list[int] = []
-            option_voter_ids: set[int] = set()
-            for _, vote_opt, tier in valid_votes:
-                if vote_opt == oi and 1 <= tier <= num_tiers:
-                    tier_counts[tier - 1] += 1
-                    option_tiers.append(tier)
-            for uid, vote_opt, _ in valid_votes:
-                if vote_opt == oi:
-                    option_voter_ids.add(uid)
-            unique_option_voters = len(option_voter_ids)
-            quorum_met_for_option = unique_option_voters >= min_unique_voters_required
-            total_opt_votes = len(option_tiers)
-            if not quorum_met_for_option:
-                option_quorum_failed = True
-                assignments.append(None)
-                quorum_fail_lines.append(
-                    f"`{oi+1}` {opt}: {unique_option_voters} unique eligible voter(s) "
-                    f"< required {math.ceil(min_unique_voters_required)}"
-                )
-                report_lines.append(
-                    f"**{oi+1}. {opt}** — inconclusive (unique eligible voters {unique_option_voters}/"
-                    f"{num_active_eligible}; need at least {math.ceil(min_unique_voters_required)})"
-                )
-                continue
-            if total_opt_votes == 0:
-                assignments.append(None)
-                report_lines.append(f"**{oi+1}. {opt}** — inconclusive (no votes)")
-                continue
-            mode_count = max(tier_counts)
-            mode_tier = tier_counts.index(mode_count) + 1
-            mode_freq = mode_count / total_opt_votes
-            n_eff, p_win = compute_option_pwin_from_tiers(tier_counts)
-            if mode_freq >= p_win:
-                assignments.append(mode_tier)
-                report_lines.append(
-                    f"**{oi+1}. {opt}** — Tier {mode_tier} via Simpson threshold "
-                    f"(mode {mode_freq*100:.1f}% >= {p_win*100:.1f}%, n_eff={n_eff:.3f})"
-                )
-            else:
-                ev, lo, hi = expected_value_and_ci_90(tier_counts)
-                assigned = ci_to_tier(lo, hi, num_tiers)
-                if assigned is None:
-                    assignments.append(None)
-                    report_lines.append(
-                        f"**{oi+1}. {opt}** — inconclusive after fallback "
-                        f"(E={ev:.3f}, CI90=({lo:.3f}, {hi:.3f}))"
-                    )
-                else:
-                    assignments.append(assigned)
-                    report_lines.append(
-                        f"**{oi+1}. {opt}** — Tier {assigned} via EV fallback "
-                        f"(E={ev:.3f}, CI90=({lo:.3f}, {hi:.3f}))"
-                    )
-
-        t1_idxs = [i for i, t in enumerate(assignments) if t == 1]
-        assigned_only = [t for t in assignments if t is not None]
-
-        if option_quorum_failed:
-            attempts = int(poll["attempts"]) + 1
-            new_status = "annulled" if attempts >= 3 else "failed_stage1"
-            await db.set_stage_poll_status(poll_id, new_status, attempts=attempts)
-            outcome = (
-                "❌ Stage 1 inconclusive: one or more options did not meet the minimum unique-voter threshold "
-                f"({QUORUM_PERCENT * 100:.0f}% of active eligible voters).\n"
-                + "\n".join(quorum_fail_lines)
-                + "\n"
-                + ("Proposal annulled after 3 failures." if attempts >= 3 else "Proposal should be rescheduled.")
-            )
-        elif not assigned_only:
-            attempts = int(poll["attempts"]) + 1
-            new_status = "annulled" if attempts >= 3 else "failed_stage1"
-            await db.set_stage_poll_status(poll_id, new_status, attempts=attempts)
-            outcome = (
-                "❌ Stage 1 failed entirely. "
-                + ("Proposal annulled after 3 failures." if attempts >= 3 else "Proposal should be rescheduled.")
-            )
-        elif len(t1_idxs) >= 2:
-            pref_secs = int(poll.get("preference_duration_seconds") or 0)
-            labels = ", ".join([f"`{i+1}` {options[i]}" for i in t1_idxs])
-            pref_options = [options[i] for i in t1_idxs]
-            pref_lines = [f"{POLL_EMOJIS[i]} {opt}" for i, opt in enumerate(pref_options)]
-            pref_embed = discord.Embed(
-                title=f"🗳️ Stage 2 Preference: {poll['title']} (from ID {poll_id})",
-                description="\n".join(pref_lines),
-                color=0x2E86AB,
-                timestamp=discord.utils.utcnow(),
-            )
-            pref_embed.set_footer(text=f"Closes in {format_duration(pref_secs)} • React to vote (one or more allowed)")
-            pref_msg = await channel.send(embed=pref_embed)
-            for i in range(len(pref_options)):
-                await pref_msg.add_reaction(POLL_EMOJIS[i])
-            await db.create_poll(
-                guild_id=guild.id,
-                channel_id=poll["channel_id"],
-                message_id=pref_msg.id,
-                title=f"[Stage 2] {poll['title']} (from stage poll #{poll_id})",
-                options=pref_options,
-                role_ids=[],
-                duration_seconds=pref_secs,
-            )
-            await db.set_stage_poll_status(poll_id, "preference_open", preference_options=t1_idxs)
-            outcome = (
-                "🗳️ Stage 2 preference opened (Tier 1 tie). "
-                f"Eligible options: {labels}. Vote by reaction in the Stage 2 message. "
-                f"It auto-closes in {format_duration(pref_secs)} with results posted automatically."
-            )
-        elif len(t1_idxs) == 1:
-            winner = t1_idxs[0]
-            await db.set_stage_poll_status(poll_id, "passed_auto")
-            outcome = f"✅ Auto-selected option `{winner+1}` ({options[winner]}) — only Tier 1 option."
-        else:
-            min_tier = min(assigned_only)
-            min_idxs = [i for i, t in enumerate(assignments) if t == min_tier]
-            if len(set(assigned_only)) == 1 or len(min_idxs) > 1:
-                pref_secs = int(poll.get("preference_duration_seconds") or 0)
-                labels = ", ".join([f"`{i+1}` {options[i]}" for i in min_idxs])
-                pref_options = [options[i] for i in min_idxs]
-                pref_lines = [f"{POLL_EMOJIS[i]} {opt}" for i, opt in enumerate(pref_options)]
-                pref_embed = discord.Embed(
-                    title=f"🗳️ Stage 2 Preference: {poll['title']} (from ID {poll_id})",
-                    description="\n".join(pref_lines),
-                    color=0x2E86AB,
-                    timestamp=discord.utils.utcnow(),
-                )
-                pref_embed.set_footer(text=f"Closes in {format_duration(pref_secs)} • React to vote (one or more allowed)")
-                pref_msg = await channel.send(embed=pref_embed)
-                for i in range(len(pref_options)):
-                    await pref_msg.add_reaction(POLL_EMOJIS[i])
-                await db.create_poll(
-                    guild_id=guild.id,
-                    channel_id=poll["channel_id"],
-                    message_id=pref_msg.id,
-                    title=f"[Stage 2] {poll['title']} (from stage poll #{poll_id})",
-                    options=pref_options,
-                    role_ids=[],
-                    duration_seconds=pref_secs,
-                )
-                await db.set_stage_poll_status(poll_id, "preference_open", preference_options=min_idxs)
-                outcome = (
-                    "🗳️ Stage 2 preference opened. "
-                    f"Eligible options: {labels}. Vote by reaction in the Stage 2 message. "
-                    f"It auto-closes in {format_duration(pref_secs)} with results posted automatically."
-                )
-            else:
-                winner = min_idxs[0]
-                await db.set_stage_poll_status(poll_id, "passed_auto")
-                outcome = f"✅ Auto-selected option `{winner+1}` ({options[winner]}) — lowest assigned tier."
-
-        embed = discord.Embed(
-            title=f"📊 Stage 1 Results: {poll['title']} (ID {poll_id})",
-            description="\n".join(report_lines + ["", outcome]),
-            color=0x2E86AB,
-            timestamp=discord.utils.utcnow(),
-        )
-        await channel.send(embed=embed)
-
-    @poll_group.command(name="delete", description="Remove a poll from the bot (Mod/Admin). Optionally delete the message.")
+    @poll_group.command(name="delete", description="Remove a poll (Mod/Admin).")
     async def poll_delete(
         self,
         ctx: discord.ApplicationContext,
-        poll_id: Option(int, "Poll ID (shown when the poll was created)", required=True),
-        delete_message: Option(
-            bool,
-            "Try to delete the poll message in Discord (default: true)",
-            required=False,
-        ) = True,
+        poll_id: Option(int, "Poll ID", required=True),
+        delete_message: Option(bool, "Try to delete the poll message (default: true)", required=False) = True,
     ) -> None:
         if not ctx.guild or not ctx.author:
             await ctx.respond("Must be used in a server.", ephemeral=True)
@@ -798,7 +633,7 @@ class PollCog(commands.Cog):
                     pass
         await db.delete_poll(poll_id)
         await self._refresh_live_status_messages(ctx.guild.id, "regular", poll_id)
-        await ctx.respond(f"Poll **{poll_id}** removed from the bot.", ephemeral=True)
+        await ctx.respond(f"Poll **{poll_id}** removed.", ephemeral=True)
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
@@ -810,12 +645,7 @@ class PollCog(commands.Cog):
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent) -> None:
         await self._handle_reaction(payload, add=False)
 
-    async def _handle_reaction(
-        self,
-        payload: discord.RawReactionActionEvent,
-        *,
-        add: bool,
-    ) -> None:
+    async def _handle_reaction(self, payload: discord.RawReactionActionEvent, *, add: bool) -> None:
         emoji_key = str(payload.emoji)
         if emoji_key not in EMOJI_TO_INDEX:
             return
@@ -833,50 +663,6 @@ class PollCog(commands.Cog):
             await db.remove_poll_vote(poll["id"], payload.user_id, option_index)
         if payload.guild_id:
             await self._refresh_live_status_messages(payload.guild_id, "regular", int(poll["id"]))
-
-    @tasks.loop(seconds=30)
-    async def check_poll_closures(self) -> None:
-        pending = await db.get_pending_polls()
-        for poll in pending:
-            if str(poll.get("title", "")).startswith("[Stage 2] "):
-                # Stage 2 reactions are finalized via pending_preference stage-poll rows.
-                continue
-            await self._close_poll(poll)
-            await self._refresh_live_status_messages(int(poll["guild_id"]), "regular", int(poll["id"]))
-            await db.delete_poll(poll["id"])
-        pending_stage1 = await db.get_pending_stage1_polls()
-        for poll in pending_stage1:
-            guild = self.bot.get_guild(poll["guild_id"])
-            if not guild:
-                continue
-            channel = guild.get_channel(poll["channel_id"])
-            if not channel:
-                try:
-                    channel = await guild.fetch_channel(poll["channel_id"])
-                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                    continue
-            if not channel or not isinstance(channel, discord.TextChannel):
-                continue
-            await self._close_stage1_and_post(guild, poll, channel)
-            await self._refresh_live_status_messages(int(poll["guild_id"]), "stage", int(poll["id"]))
-        pending_pref = await db.get_pending_preference_polls()
-        for poll in pending_pref:
-            guild = self.bot.get_guild(poll["guild_id"])
-            if not guild:
-                continue
-            channel = guild.get_channel(poll["channel_id"])
-            if not channel:
-                try:
-                    channel = await guild.fetch_channel(poll["channel_id"])
-                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                    continue
-            if not channel or not isinstance(channel, discord.TextChannel):
-                continue
-            await self._close_preference_and_post(guild, poll, channel)
-            await self._refresh_live_status_messages(int(poll["guild_id"]), "stage", int(poll["id"]))
-        # Periodic refresh keeps countdown/status boards live even without new votes.
-        for guild_id, kind, poll_id in await db.list_live_poll_status_targets():
-            await self._refresh_live_status_messages(guild_id, kind, poll_id)
 
     async def _close_poll(self, poll: dict) -> None:
         guild = self.bot.get_guild(poll["guild_id"])
@@ -919,12 +705,12 @@ class PollCog(commands.Cog):
             passed = False
 
         result_lines = [
-            f"**1. No. of Active Eligible Voters:** {num_active_eligible}",
-            f"**2. Total Number of Valid Voters:** {num_valid_voters}",
-            f"**3. Total Number of Valid Votes:** {total_valid_votes}",
-            f"**4. Percentage of Eligible Voters that Voted:** {pct_eligible_voted:.1f}%",
-            f"**5. Winning Vote Percentage Required (Simpson):** {pwin_required * 100:.1f}% (n_eff={n_eff:.3f})",
-            f"**6. Winning Vote Percentage Acquired:** {winning_pct:.1f}% ({winning_label})",
+            f"**1. Active Eligible Voters:** {num_active_eligible}",
+            f"**2. Valid Voters:** {num_valid_voters}",
+            f"**3. Valid Votes:** {total_valid_votes}",
+            f"**4. Eligible Participation:** {pct_eligible_voted:.1f}%",
+            f"**5. Simpson Threshold:** {pwin_required * 100:.1f}% (n_eff={n_eff:.3f})",
+            f"**6. Winning Percentage:** {winning_pct:.1f}% ({winning_label})",
             "",
         ]
         if passed:
@@ -944,6 +730,51 @@ class PollCog(commands.Cog):
             await channel.send(embed=embed)
         except discord.HTTPException:
             pass
+
+    @tasks.loop(seconds=30)
+    async def check_poll_closures(self) -> None:
+        pending = await db.get_pending_polls()
+        for poll in pending:
+            if str(poll.get("title", "")).startswith("[Stage 2] "):
+                continue
+            await self._close_poll(poll)
+            await self._refresh_live_status_messages(int(poll["guild_id"]), "regular", int(poll["id"]))
+            await db.delete_poll(poll["id"])
+
+        pending_stage1 = await db.get_pending_stage1_polls()
+        for poll in pending_stage1:
+            guild = self.bot.get_guild(poll["guild_id"])
+            if not guild:
+                continue
+            channel = guild.get_channel(poll["channel_id"])
+            if not channel:
+                try:
+                    channel = await guild.fetch_channel(poll["channel_id"])
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    continue
+            if not channel or not isinstance(channel, discord.TextChannel):
+                continue
+            await self._close_stage1_and_post(guild, poll, channel)
+            await self._refresh_live_status_messages(int(poll["guild_id"]), "stage", int(poll["id"]))
+
+        pending_pref = await db.get_pending_preference_polls()
+        for poll in pending_pref:
+            guild = self.bot.get_guild(poll["guild_id"])
+            if not guild:
+                continue
+            channel = guild.get_channel(poll["channel_id"])
+            if not channel:
+                try:
+                    channel = await guild.fetch_channel(poll["channel_id"])
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    continue
+            if not channel or not isinstance(channel, discord.TextChannel):
+                continue
+            await self._close_preference_and_post(guild, poll, channel)
+            await self._refresh_live_status_messages(int(poll["guild_id"]), "stage", int(poll["id"]))
+
+        for guild_id, kind, poll_id in await db.list_live_poll_status_targets():
+            await self._refresh_live_status_messages(guild_id, kind, poll_id)
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
