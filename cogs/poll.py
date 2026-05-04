@@ -3,13 +3,21 @@
 Stage 1 tier assignments are submitted through the Interspace frontend.
 This cog handles:
   - /poll stage_create  → registers the poll with Interspace, posts announcement.
+                          Now takes a single proposal_id (the PROP-XXXX from
+                          Interspace) and derives title/text/type/tier from it.
   - /poll stage_close   → manually triggers result computation on Interspace.
   - /poll status        → shows current poll results.
   - /poll delete        → removes a poll.
   - /poll preference_create → unchanged simple reaction poll (no Interspace).
   - Background task     → auto-closes expired polls; fetches results from Interspace.
 
+Petition Hall:
+  When Interspace approves a proposal it can be re-posted by the bot to the
+  configured channel "🏰-the-petition-hall" using `post_to_petition_hall`.
+
 Removed: /poll stage_vote (voting is now done on the Interspace web UI).
+Removed parameters from stage_create: proposal_type, proposal_text, roles
+  (role gating now derives from the proposal tier on the Interspace side).
 """
 
 import json
@@ -30,6 +38,7 @@ POLL_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣",
 EMOJI_TO_INDEX = {e: i for i, e in enumerate(POLL_EMOJIS)}
 ACTIVE_ROLE_NAME = "active"
 QUORUM_PERCENT = 0.65
+PETITION_HALL_CHANNEL_NAME = "🏰-the-petition-hall"
 
 
 def parse_duration(s: str) -> int | None:
@@ -84,6 +93,71 @@ async def _interspace_post(path: str, payload: dict) -> dict | None:
                 return None
     except Exception as exc:
         print(f"[Interspace] POST {path} failed: {exc}")
+        return None
+
+
+async def _interspace_get(path: str) -> dict | None:
+    """GET from Interspace backend. Returns parsed JSON or None on failure."""
+    if not INTERSPACE_URL or not INTERSPACE_BOT_SECRET:
+        return None
+    url = f"{INTERSPACE_URL}{path}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=_interspace_headers(), timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                text = await resp.text()
+                print(f"[Interspace] GET {path} → {resp.status}: {text[:200]}")
+                return None
+    except Exception as exc:
+        print(f"[Interspace] GET {path} failed: {exc}")
+        return None
+
+
+def _format_petition_hall_post(proposal: dict) -> str:
+    """Build the petition-hall message in the requested format.
+
+        [Proposal Type] & [Proposal Tier]
+        [Proposal Title]: [Proposal ID]
+        [Proposal Content]
+    """
+    ptype = (proposal.get("proposalType") or "format").replace("_", " ").title()
+    tier = proposal.get("tier")
+    sub = proposal.get("tier3SubType")
+    if tier == 3 and sub:
+        tier_str = f"Tier 3 (Type {sub})"
+    elif tier:
+        tier_str = f"Tier {tier}"
+    else:
+        tier_str = "Untiered"
+    title = proposal.get("title") or ""
+    short_id = proposal.get("proposalId") or proposal.get("id") or ""
+    content = proposal.get("proposalText") or ""
+    return (
+        f"```\n"
+        f"{ptype} & {tier_str}\n\n"
+        f"{title}: {short_id}\n\n"
+        f"{content}\n"
+        f"```"
+    )
+
+
+async def post_to_petition_hall(guild: discord.Guild, proposal: dict) -> discord.Message | None:
+    """Post an approved proposal to '🏰-the-petition-hall' if the channel exists."""
+    if not guild:
+        return None
+    channel = discord.utils.get(guild.text_channels, name=PETITION_HALL_CHANNEL_NAME)
+    if channel is None:
+        # Try a looser match — Discord normalizes some emoji + dash names.
+        channel = next((c for c in guild.text_channels
+                        if c.name.replace("_", "-") == PETITION_HALL_CHANNEL_NAME.replace("_", "-")), None)
+    if channel is None:
+        print(f"[PetitionHall] Channel '{PETITION_HALL_CHANNEL_NAME}' not found in guild {guild.id}")
+        return None
+    try:
+        return await channel.send(_format_petition_hall_post(proposal))
+    except discord.HTTPException as exc:
+        print(f"[PetitionHall] Failed to post: {exc}")
         return None
 
 
@@ -300,23 +374,21 @@ class PollCog(commands.Cog):
         )
         await ctx.respond(f"Poll created. ID: {poll_id}", ephemeral=True)
 
-    @poll_group.command(name="stage_create", description="Create a two-stage tier poll (voting via Interspace).")
+    @poll_group.command(name="stage_create", description="Create a two-stage tier poll bound to an Interspace proposal.")
     async def stage_create(
         self,
         ctx: discord.ApplicationContext,
-        title: Option(str, "Proposal title", required=True),
+        proposal_id: Option(str, "Interspace proposal ID (e.g. PROP-A4F2)", required=True),
         options: Option(str, "Comma-separated options", required=True),
         duration: Option(str, "Stage 1 duration (e.g. 1d, 24h, 60m)", required=True),
         preference_duration: Option(str, "Stage 2 preference duration if needed", required=True),
         num_tiers: Option(int, "Number of tiers (n tiers)", required=True),
-        proposal_type: Option(
-            str, "Proposal category shown on Interspace",
-            choices=["banlist", "errata", "format", "card_request"],
-            required=False,
-        ) = "format",
-        proposal_text: Option(str, "Proposal description shown on Interspace", required=False) = "",
-        roles: Option(str, "Role names that can vote, comma-separated. Empty = everyone.", required=False) = None,
     ) -> None:
+        """Open a two-stage tier poll for an approved proposal.
+
+        Title, content, type and voter-role gating are derived from the
+        proposal on the Interspace side — no need to re-enter them.
+        """
         if not ctx.guild or not ctx.author:
             await ctx.respond("Must be used in a server.", ephemeral=True)
             return
@@ -335,46 +407,50 @@ class PollCog(commands.Cog):
         if not pref_dur_sec or pref_dur_sec < 60:
             await ctx.respond("Invalid preference_duration. Minimum is 1 minute.", ephemeral=True)
             return
-        role_ids: list[int] = []
-        if roles and roles.strip():
-            for rname in [r.strip() for r in roles.split(",") if r.strip()]:
-                role = discord.utils.get(ctx.guild.roles, name=rname)
-                if not role:
-                    await ctx.respond(f"Role **{rname}** not found.", ephemeral=True)
-                    return
-                role_ids.append(role.id)
+        # Pre-fetch the proposal so the poll title/embed can include details
+        # before round-tripping through the local DB.
+        proposal = await _interspace_get(f"/api/proposals/{proposal_id}")
+        if proposal is None:
+            await ctx.respond(
+                f"Could not find proposal **{proposal_id}** on Interspace.",
+                ephemeral=True,
+            )
+            return
+        if proposal.get("status") not in ("approved", "creator_claimed", "submitted"):
+            await ctx.respond(
+                f"Proposal **{proposal_id}** is not approved (status: {proposal.get('status')}).",
+                ephemeral=True,
+            )
+            return
 
-        # Create poll in local bot DB first
+        title = proposal.get("title") or proposal_id
+
+        # Local bot DB (still useful for /poll status and timer-driven closure)
         poll_id = await db.create_stage_poll(
             guild_id=ctx.guild.id,
             channel_id=ctx.channel.id,
             title=title,
             options=opts,
-            role_ids=role_ids,
+            role_ids=[],  # role gating now lives on Interspace, derived from tier
             num_tiers=num_tiers,
             duration_seconds=dur_sec,
             preference_duration_seconds=pref_dur_sec,
         )
 
-        # Register poll on Interspace so users can vote via the web UI
-        import time
-        closes_at_iso = None
+        # Register poll on Interspace so the web UI knows about it.
+        import datetime
         try:
-            import datetime
             closes_at_iso = (datetime.datetime.utcnow() + datetime.timedelta(seconds=dur_sec)).isoformat() + "Z"
         except Exception:
-            pass
+            closes_at_iso = None
 
         interspace_result = await _interspace_post("/api/polls/open", {
             "botPollId": poll_id,
             "guildId": ctx.guild.id,
             "channelId": ctx.channel.id,
-            "title": title,
-            "proposalType": proposal_type,
-            "proposalText": proposal_text,
+            "proposalId": proposal_id,
             "options": opts,
             "numTiers": num_tiers,
-            "roleIds": role_ids,
             "closesAt": closes_at_iso,
             "preferenceDurationSeconds": pref_dur_sec,
         })
@@ -386,11 +462,28 @@ class PollCog(commands.Cog):
             else:
                 interspace_note = "\n\n⚠️ Interspace registration failed — voting may not be available on web."
 
+        # Compose tier hint for the announcement
+        tier = proposal.get("tier")
+        sub = proposal.get("tier3SubType")
+        if tier == 3 and sub:
+            tier_label = f"Tier 3 — Type {sub}"
+            who = "Overseers only" if sub == "I" else "Overseers + Admins"
+        elif tier == 2:
+            tier_label = "Tier 2"
+            who = "Format Council"
+        elif tier == 1:
+            tier_label = "Tier 1"
+            who = "Everyone"
+        else:
+            tier_label = "Untiered"
+            who = "(see Interspace)"
+
         opt_lines = "\n".join([f"`{i+1}`. {opt}" for i, opt in enumerate(opts)])
         embed = discord.Embed(
             title=f"⚖️ Stage 1 Open: {title}",
             description=(
                 f"**Poll ID:** `{poll_id}`\n"
+                f"**Proposal:** `{proposal_id}` ({tier_label} • {who})\n"
                 f"**Tier range:** 1 to {num_tiers} (1 = most balanced)\n\n"
                 f"**Options:**\n{opt_lines}"
                 f"{interspace_note}"
@@ -405,7 +498,11 @@ class PollCog(commands.Cog):
             )
         )
         await ctx.channel.send(embed=embed)
-        await ctx.respond(f"Two-stage poll created with ID `{poll_id}`.", ephemeral=True)
+
+        # Also drop a copy into the petition hall in the requested format.
+        await post_to_petition_hall(ctx.guild, proposal)
+
+        await ctx.respond(f"Two-stage poll created with ID `{poll_id}` for proposal `{proposal_id}`.", ephemeral=True)
 
     @poll_group.command(name="stage_close", description="Close Stage 1 and fetch/post results from Interspace.")
     async def stage_close(
