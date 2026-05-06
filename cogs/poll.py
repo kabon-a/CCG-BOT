@@ -117,11 +117,18 @@ async def _interspace_get(path: str) -> dict | None:
 def _format_petition_hall_post(proposal: dict) -> str:
     """Build the petition-hall message in the requested format.
 
-        [Proposal Type] & [Proposal Tier]
-        [Proposal Title]: [Proposal ID]
-        [Proposal Content]
+        <Pretty Type> Proposal by <Interspace Username>
+        ```
+        Proposal Title: <title> | <PROP-XXXX>
+        Tier <n>          (or "Tier 3 (Type I/II)" for tier 3)
+        Quotation: <proposal text>
+        ```
     """
-    ptype = (proposal.get("proposalType") or "format").replace("_", " ").title()
+    raw_type = (proposal.get("proposalType") or "format").replace("_", " ")
+    nice_type = raw_type.title()
+    # Don't duplicate the word "Proposal" if the type already includes it.
+    header_type = nice_type if "proposal" in nice_type.lower() else f"{nice_type} Proposal"
+
     tier = proposal.get("tier")
     sub = proposal.get("tier3SubType")
     if tier == 3 and sub:
@@ -130,14 +137,22 @@ def _format_petition_hall_post(proposal: dict) -> str:
         tier_str = f"Tier {tier}"
     else:
         tier_str = "Untiered"
-    title = proposal.get("title") or ""
+
+    def _safe(s: str | None) -> str:
+        # Strip triple-backticks so user content can't break the code fence.
+        return (s or "").replace("```", "''")
+
+    title = _safe(proposal.get("title"))
     short_id = proposal.get("proposalId") or proposal.get("id") or ""
-    content = proposal.get("proposalText") or ""
+    content = _safe(proposal.get("proposalText"))
+    username = proposal.get("username") or "Unknown"
+
     return (
+        f"{header_type} by {username}\n"
         f"```\n"
-        f"{ptype} & {tier_str}\n\n"
-        f"{title}: {short_id}\n\n"
-        f"{content}\n"
+        f"Proposal Title: {title} | {short_id}\n"
+        f"{tier_str}\n"
+        f"Quotation: {content}\n"
         f"```"
     )
 
@@ -407,6 +422,7 @@ class PollCog(commands.Cog):
         if not pref_dur_sec or pref_dur_sec < 60:
             await ctx.respond("Invalid preference_duration. Minimum is 1 minute.", ephemeral=True)
             return
+
         # Pre-fetch the proposal so the poll title/embed can include details
         # before round-tripping through the local DB.
         proposal = await _interspace_get(f"/api/proposals/{proposal_id}")

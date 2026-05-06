@@ -7,7 +7,6 @@ from discord.ext import commands
 import database as db
 from config import BOT_TOKEN
 
-
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True  # Required for /leaderboard match (Member option)
@@ -29,6 +28,8 @@ def main() -> None:
     bot.load_extension("cogs.active")
     bot.load_extension("cogs.poll")
     bot.load_extension("cogs.translate")
+    # Discord ↔ Interspace account linking (/discord_link, /discord_unlink)
+    bot.load_extension("cogs.link")
     bot.run(BOT_TOKEN)
 
 
