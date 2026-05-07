@@ -23,10 +23,12 @@ Unlinking:
     to roundtrip through Interspace to drop the binding.
 """
 
+import asyncio
+
 import aiohttp
 import discord
 from discord import Option
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from config import INTERSPACE_URL, INTERSPACE_BOT_SECRET
 
@@ -94,6 +96,84 @@ class LinkCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        """Start the live-sync loop once the bot is connected and has its
+        guild member cache populated."""
+        if not self.live_role_sync.is_running():
+            self.live_role_sync.start()
+
+    @tasks.loop(minutes=1)
+    async def live_role_sync(self) -> None:
+        """Continuously mirror every guild member's Discord roles to
+        Interspace. on_member_update only fires on *changes*, which leaves
+        stale state any time the bot misses an event (offline, restart, or
+        the link being created before this listener shipped). Polling every
+        minute keeps Interspace's view of Discord roles converged within
+        ~one minute regardless of what events the bot did or didn't see.
+
+        Unlinked users are silently no-op'd by the Interspace endpoint so
+        we don't gate the loop on link state — that also means linking
+        is reflected within one tick of the loop without any extra plumbing.
+        @tasks.loop never overlaps iterations, so an unusually large guild
+        that doesn't finish in 60 s simply throttles itself naturally.
+        """
+        for guild in self.bot.guilds:
+            for member in guild.members:
+                if member.bot:
+                    continue
+                tracked, is_active = _collect_member_roles(member)
+                await _interspace_post(
+                    "/api/discord/sync-roles",
+                    {
+                        "discordId": str(member.id),
+                        "roles": tracked,
+                        "isActive": is_active,
+                    },
+                )
+                # 10 req/s ceiling — a 1000-member guild finishes in <2 min.
+                await asyncio.sleep(0.1)
+
+    @live_role_sync.before_loop
+    async def before_live_role_sync(self) -> None:
+        await self.bot.wait_until_ready()
+
+    @commands.slash_command(
+        name="discord_resync",
+        description="Admin: re-push every guild member's roles to Interspace.",
+        default_member_permissions=discord.Permissions(administrator=True),
+    )
+    async def discord_resync(self, ctx: discord.ApplicationContext) -> None:
+        """Manual re-trigger of the on_ready backfill.
+
+        Useful if the bot was already running when an admin granted roles
+        in Discord and they want Interspace to reflect them right now
+        rather than wait for whatever event the role-update produces.
+        """
+        if not INTERSPACE_URL or not INTERSPACE_BOT_SECRET:
+            await ctx.respond("Interspace integration not configured.", ephemeral=True)
+            return
+        if not ctx.guild:
+            await ctx.respond("Run this in a server.", ephemeral=True)
+            return
+        await ctx.defer(ephemeral=True)
+        count = 0
+        for member in ctx.guild.members:
+            if member.bot:
+                continue
+            tracked, is_active = _collect_member_roles(member)
+            await _interspace_post(
+                "/api/discord/sync-roles",
+                {
+                    "discordId": str(member.id),
+                    "roles": tracked,
+                    "isActive": is_active,
+                },
+            )
+            count += 1
+            await asyncio.sleep(0.1)
+        await ctx.respond(f"Re-pushed roles for {count} members.", ephemeral=True)
 
     @commands.slash_command(
         name="discord_link",
