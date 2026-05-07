@@ -30,6 +30,28 @@ from discord.ext import commands
 
 from config import INTERSPACE_URL, INTERSPACE_BOT_SECRET
 
+# Must match Backend/server.js DISCORD_ROLE_MAP keys exactly. Any role not in
+# this set is ignored by Interspace's role sync.
+INTERSPACE_TRACKED_ROLES = {
+    "Creator",
+    "Overseer",
+    "Overseer in Training",
+    "Administrator",
+    "Artist",
+    "The Format Council",
+}
+ACTIVE_ROLE_NAME = "active"
+
+
+def _collect_member_roles(member: discord.Member | None) -> tuple[list[str], bool]:
+    """Return (role_names_for_interspace, has_active_role) for a guild member."""
+    if not member:
+        return [], False
+    role_names = [r.name for r in member.roles]
+    tracked = [r for r in role_names if r in INTERSPACE_TRACKED_ROLES]
+    is_active = ACTIVE_ROLE_NAME in role_names
+    return tracked, is_active
+
 
 def _interspace_headers() -> dict:
     return {"x-bot-secret": INTERSPACE_BOT_SECRET, "Content-Type": "application/json"}
@@ -109,12 +131,20 @@ class LinkCog(commands.Cog):
         if getattr(ctx.author, "discriminator", "0") not in ("0", "", None):
             discord_username = f"{discord_username}#{ctx.author.discriminator}"
 
+        # Snapshot the user's current Discord roles + @active state so Interspace
+        # can grant matching roles immediately on link instead of waiting for the
+        # next on_member_update event.
+        member = ctx.guild.get_member(ctx.author.id) if ctx.guild else None
+        tracked_roles, is_active = _collect_member_roles(member)
+
         status, body = await _interspace_post(
             "/api/discord/link/complete",
             {
                 "code": clean_code,
                 "discordId": str(ctx.author.id),
                 "discordUsername": discord_username,
+                "roles": tracked_roles,
+                "isActive": is_active,
             },
         )
 
@@ -149,6 +179,45 @@ class LinkCog(commands.Cog):
             f"Link failed (status {status}). Please try again.",
             ephemeral=True,
         )
+
+    @commands.Cog.listener()
+    async def on_member_update(
+        self,
+        before: discord.Member,
+        after: discord.Member,
+    ) -> None:
+        """Push role changes for any member to Interspace.
+
+        Interspace treats this call as authoritative for the tracked-role set
+        (Creator/Overseer/OIT/Administrator/Artist/Format Council). Unlinked
+        users are silently no-op'd server-side, so we don't need to gate
+        locally — that also means the very first sync after a link is covered
+        even if linking happened on a different bot session.
+        """
+        if before.bot or after.bot:
+            return
+        before_tracked, before_active = _collect_member_roles(before)
+        after_tracked, after_active = _collect_member_roles(after)
+        if (
+            sorted(before_tracked) == sorted(after_tracked)
+            and before_active == after_active
+        ):
+            return
+        await _interspace_post(
+            "/api/discord/sync-roles",
+            {
+                "discordId": str(after.id),
+                "roles": after_tracked,
+                "isActive": after_active,
+            },
+        )
+        # Mirror @active removal explicitly so Interspace can drop the user
+        # from poll quorum immediately rather than waiting for the next pulse.
+        if before_active and not after_active:
+            await _interspace_post(
+                "/api/discord/active-role-removed",
+                {"discordId": str(after.id)},
+            )
 
     @commands.slash_command(
         name="discord_unlink",
