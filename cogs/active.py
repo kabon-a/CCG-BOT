@@ -1,9 +1,8 @@
 """Active cog — assign @active role to users with recent activity (within 7 days).
 
-Activity is recorded on three flavours of Discord events:
-  * messages
-  * reactions (legacy ``on_reaction_add`` + raw payload for cache-miss cases)
-  * any slash-command interaction
+Activity is recorded on two criteria:
+  * messages or reactions in the designated courtroom channel
+  * admin-approved /record_match submissions
 
 Every grant also pings Interspace via ``/api/discord/active-ping`` so that
 linked Interspace users count toward the 65% poll-quorum on the web side.
@@ -17,6 +16,8 @@ Interspace would lose @active and be excluded from poll quorums.
 
 from __future__ import annotations
 
+from typing import Dict
+
 import aiohttp
 import discord
 from discord.ext import commands, tasks
@@ -25,7 +26,11 @@ import database as db
 from config import INTERSPACE_URL, INTERSPACE_BOT_SECRET
 
 ACTIVE_ROLE_NAME = "active"
+COURTROOM_CHANNEL_NAME = "❗❗-the-courtroom"
 INTERSPACE_PULSE_INTERVAL_MINUTES = 5
+
+APPROVE_EMOJI = "✅"
+REJECT_EMOJI = "❌"
 
 
 def setup(bot: commands.Bot) -> None:
@@ -192,6 +197,10 @@ class ActiveCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        # message_id → { "guild_id": int, "user_id": int, "replay": str }
+        self._pending_match_approvals: Dict[int, dict] = {}
+
+    # ── Periodic tasks ──────────────────────────────────────────────────────────
 
     @tasks.loop(hours=24)
     async def cleanup_stale_active(self) -> None:
@@ -208,10 +217,15 @@ class ActiveCog(commands.Cog):
         if not self.pull_interspace_activity.is_running():
             self.pull_interspace_activity.start()
 
+    # ── Activity listeners (courtroom-only) ─────────────────────────────────────
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
-        if message.guild and message.author:
-            await grant_active_and_record(message.guild, message.author)
+        if not message.guild or not message.author:
+            return
+        if message.channel.name != COURTROOM_CHANNEL_NAME:
+            return
+        await grant_active_and_record(message.guild, message.author)
 
     @commands.Cog.listener()
     async def on_reaction_add(
@@ -219,17 +233,114 @@ class ActiveCog(commands.Cog):
         reaction: discord.Reaction,
         user: discord.User | discord.Member,
     ) -> None:
-        if reaction.message.guild and user:
-            await grant_active_and_record(reaction.message.guild, user)
+        if not reaction.message.guild or not user:
+            return
+        if reaction.message.channel.name != COURTROOM_CHANNEL_NAME:
+            return
+        await grant_active_and_record(reaction.message.guild, user)
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
         guild = self.bot.get_guild(payload.guild_id)
+        if not guild:
+            return
+
+        # Check if this reaction is an admin approval/rejection for a pending match
+        if payload.message_id in self._pending_match_approvals:
+            await self._handle_match_reaction(guild, payload)
+            return
+
+        # Only grant @active for reactions in the courtroom channel
+        channel = guild.get_channel(payload.channel_id)
+        if not channel or getattr(channel, 'name', None) != COURTROOM_CHANNEL_NAME:
+            return
         user = self.bot.get_user(payload.user_id)
-        if guild and user:
+        if user:
             await grant_active_and_record(guild, user)
 
-    @commands.Cog.listener()
-    async def on_interaction(self, interaction: discord.Interaction) -> None:
-        if interaction.guild and interaction.user:
-            await grant_active_and_record(interaction.guild, interaction.user)
+    # ── /record_match command ────────────────────────────────────────────────────
+
+    @commands.slash_command(
+        name="record_match",
+        description="Submit a match replay for admin approval. Grants @active on approval.",
+    )
+    async def record_match(self, ctx: discord.ApplicationContext, replay: str) -> None:
+        if not ctx.guild:
+            await ctx.respond("This command must be used in a server.", ephemeral=True)
+            return
+
+        # Post a pending-approval message that admins can ✅/❌
+        embed = discord.Embed(
+            title="Match Replay — Pending Approval",
+            description=f"**Submitted by:** {ctx.author.mention}\n**Replay:** {replay}",
+            colour=discord.Colour.orange(),
+        )
+        embed.set_footer(text="React ✅ to approve (grants @active) or ❌ to reject.")
+
+        await ctx.respond(embed=embed)
+        msg = await ctx.interaction.original_response()
+
+        # Store the pending entry keyed by the bot's reply message ID
+        self._pending_match_approvals[msg.id] = {
+            "guild_id": ctx.guild.id,
+            "user_id": ctx.author.id,
+            "replay": replay,
+        }
+
+        # Add reaction prompts so admins can one-click approve/reject
+        try:
+            await msg.add_reaction(APPROVE_EMOJI)
+            await msg.add_reaction(REJECT_EMOJI)
+        except discord.Forbidden:
+            pass
+
+    async def _handle_match_reaction(
+        self,
+        guild: discord.Guild,
+        payload: discord.RawReactionActionEvent,
+    ) -> None:
+        """Process an admin ✅/❌ reaction on a pending match-approval message."""
+        entry = self._pending_match_approvals.get(payload.message_id)
+        if not entry:
+            return
+
+        # Only admins (members with administrator permission) may approve/reject
+        reactor = guild.get_member(payload.user_id)
+        if not reactor or reactor.bot:
+            return
+        if not reactor.guild_permissions.administrator:
+            return
+
+        emoji = str(payload.emoji)
+        if emoji not in (APPROVE_EMOJI, REJECT_EMOJI):
+            return
+
+        # Consume the entry regardless of outcome
+        del self._pending_match_approvals[payload.message_id]
+
+        channel = guild.get_channel(payload.channel_id)
+        try:
+            msg = await channel.fetch_message(payload.message_id)
+        except Exception:
+            msg = None
+
+        if emoji == APPROVE_EMOJI:
+            target = guild.get_member(entry["user_id"])
+            if target:
+                await grant_active_and_record(guild, target)
+            result_text = f"✅ Approved by {reactor.mention}. @active granted to <@{entry['user_id']}>."
+        else:
+            result_text = f"❌ Rejected by {reactor.mention}."
+
+        if msg:
+            try:
+                await msg.edit(
+                    embed=discord.Embed(
+                        title="Match Replay — " + ("Approved" if emoji == APPROVE_EMOJI else "Rejected"),
+                        description=msg.embeds[0].description if msg.embeds else "",
+                        colour=discord.Colour.green() if emoji == APPROVE_EMOJI else discord.Colour.red(),
+                    ).set_footer(text=result_text)
+                )
+                await msg.clear_reactions()
+            except Exception:
+                pass
