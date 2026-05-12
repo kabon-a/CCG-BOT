@@ -195,9 +195,12 @@ async def _pull_interspace_activity_impl(bot: commands.Bot) -> None:
 class ActiveCog(commands.Cog):
     """Assigns @active to users with recent activity. Removes from inactive users."""
 
+    # Pending approvals expire after 24 h so the dict never grows unbounded.
+    PENDING_APPROVAL_TTL_SECONDS = 86_400
+
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        # message_id → { "guild_id": int, "user_id": int, "replay": str }
+        # message_id → { "guild_id": int, "user_id": int, "replay": str, "created_at": float }
         self._pending_match_approvals: Dict[int, dict] = {}
 
     # ── Periodic tasks ──────────────────────────────────────────────────────────
@@ -205,6 +208,15 @@ class ActiveCog(commands.Cog):
     @tasks.loop(hours=24)
     async def cleanup_stale_active(self) -> None:
         await _remove_stale_active_impl(self.bot)
+        self._prune_stale_match_approvals()
+
+    def _prune_stale_match_approvals(self) -> None:
+        """Remove pending match approval entries older than TTL."""
+        import time
+        cutoff = time.time() - self.PENDING_APPROVAL_TTL_SECONDS
+        stale = [k for k, v in self._pending_match_approvals.items() if v.get("created_at", 0) < cutoff]
+        for k in stale:
+            del self._pending_match_approvals[k]
 
     @tasks.loop(minutes=INTERSPACE_PULSE_INTERVAL_MINUTES)
     async def pull_interspace_activity(self) -> None:
@@ -269,10 +281,14 @@ class ActiveCog(commands.Cog):
             await ctx.respond("This command must be used in a server.", ephemeral=True)
             return
 
+        # Strip Discord markdown special characters from user-supplied replay
+        # string to prevent formatting injection in the embed description.
+        safe_replay = (replay or "").replace("`", "\\`").replace("*", "\\*").replace("_", "\\_").replace("~", "\\~")
+
         # Post a pending-approval message that admins can ✅/❌
         embed = discord.Embed(
             title="Match Replay — Pending Approval",
-            description=f"**Submitted by:** {ctx.author.mention}\n**Replay:** {replay}",
+            description=f"**Submitted by:** {ctx.author.mention}\n**Replay:** {safe_replay}",
             colour=discord.Colour.orange(),
         )
         embed.set_footer(text="React ✅ to approve (grants @active) or ❌ to reject.")
@@ -280,11 +296,13 @@ class ActiveCog(commands.Cog):
         await ctx.respond(embed=embed)
         msg = await ctx.interaction.original_response()
 
+        import time
         # Store the pending entry keyed by the bot's reply message ID
         self._pending_match_approvals[msg.id] = {
             "guild_id": ctx.guild.id,
             "user_id": ctx.author.id,
             "replay": replay,
+            "created_at": time.time(),
         }
 
         # Add reaction prompts so admins can one-click approve/reject
