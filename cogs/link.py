@@ -32,15 +32,15 @@ from discord.ext import commands, tasks
 
 from config import INTERSPACE_URL, INTERSPACE_BOT_SECRET
 
-# Must match Backend/server.js DISCORD_ROLE_MAP keys exactly. Any role not in
-# this set is ignored by Interspace's role sync.
-INTERSPACE_TRACKED_ROLES = {
-    "Creator",
-    "Overseer",
-    "Overseer in Training",
-    "Administrator",
-    "Artist",
-    "The Format Council",
+# Server's DISCORD_ROLE_MAP normalises by case-folded key, so the exact
+# casing here doesn't have to match Discord — lookup is case-insensitive.
+INTERSPACE_TRACKED_ROLES_LC = {
+    "creator",
+    "overseer",
+    "overseer in training",
+    "administrator",
+    "artist",
+    "the format council",
 }
 ACTIVE_ROLE_NAME = "active"
 
@@ -50,8 +50,10 @@ def _collect_member_roles(member: discord.Member | None) -> tuple[list[str], boo
     if not member:
         return [], False
     role_names = [r.name for r in member.roles]
-    tracked = [r for r in role_names if r in INTERSPACE_TRACKED_ROLES]
-    is_active = ACTIVE_ROLE_NAME in role_names
+    # Case-insensitive match — Discord role names like "Overseer In Training"
+    # vs "Overseer in Training" must both be treated as the same role.
+    tracked = [r for r in role_names if r.lower() in INTERSPACE_TRACKED_ROLES_LC]
+    is_active = ACTIVE_ROLE_NAME in (n.lower() for n in role_names)
     return tracked, is_active
 
 
@@ -124,7 +126,7 @@ class LinkCog(commands.Cog):
                 if member.bot:
                     continue
                 tracked, is_active = _collect_member_roles(member)
-                await _interspace_post(
+                status, body = await _interspace_post(
                     "/api/discord/sync-roles",
                     {
                         "discordId": str(member.id),
@@ -132,6 +134,10 @@ class LinkCog(commands.Cog):
                         "isActive": is_active,
                     },
                 )
+                if status == 0:
+                    print(f"[live_role_sync] Interspace unreachable for member {member.id}")
+                elif status not in (200, 204):
+                    print(f"[live_role_sync] Unexpected status {status} for member {member.id}: {body}")
                 # 10 req/s ceiling — a 1000-member guild finishes in <2 min.
                 await asyncio.sleep(0.1)
 
@@ -200,7 +206,7 @@ class LinkCog(commands.Cog):
             return
 
         clean_code = (code or "").strip().upper()
-        if len(clean_code) < 4:
+        if len(clean_code) != 8:
             await ctx.respond("Please provide the link code from Interspace.", ephemeral=True)
             return
 
@@ -298,6 +304,71 @@ class LinkCog(commands.Cog):
                 "/api/discord/active-role-removed",
                 {"discordId": str(after.id)},
             )
+
+    @commands.slash_command(
+        name="sync_my_roles",
+        description="Re-push your current Discord roles to Interspace. Use this if your Overseer/OIT tab is missing.",
+    )
+    async def sync_my_roles(self, ctx: discord.ApplicationContext) -> None:
+        """Force-sync the invoking member's Discord roles to Interspace right now.
+
+        Covers the gap between on_member_update events: if the bot was offline
+        when your role was granted, or the periodic sync hasn't run yet, this
+        command gives you a self-service way to fix it without waiting for an
+        admin to run /discord_resync.
+        """
+        if not INTERSPACE_URL or not INTERSPACE_BOT_SECRET:
+            await ctx.respond("Interspace integration not configured.", ephemeral=True)
+            return
+        if not ctx.author:
+            await ctx.respond("Cannot resolve your Discord identity.", ephemeral=True)
+            return
+
+        member = ctx.guild.get_member(ctx.author.id) if ctx.guild else None
+        if not member:
+            await ctx.respond(
+                "Could not find you as a guild member. Run this command inside the server.",
+                ephemeral=True,
+            )
+            return
+
+        await ctx.defer(ephemeral=True)
+        tracked, is_active = _collect_member_roles(member)
+        status, body = await _interspace_post(
+            "/api/discord/sync-roles",
+            {
+                "discordId": str(ctx.author.id),
+                "roles": tracked,
+                "isActive": is_active,
+            },
+        )
+
+        if status == 0:
+            await ctx.respond(
+                "Could not reach Interspace. Try again in a minute.",
+                ephemeral=True,
+            )
+            return
+
+        if status == 200 and body:
+            if not body.get("linked"):
+                await ctx.respond(
+                    "Your Discord account is not linked to an Interspace account yet. "
+                    "Go to **Interspace → Settings → Discord Link**, generate a code, "
+                    "then run `/discord_link <code>` here.",
+                    ephemeral=True,
+                )
+                return
+            role_list = ", ".join(tracked) if tracked else "none"
+            await ctx.respond(
+                f"Roles synced to Interspace: **{role_list}**.\n"
+                "If your tab is still missing, reload the Interspace page — "
+                "the change may take up to 60 seconds to appear.",
+                ephemeral=True,
+            )
+            return
+
+        await ctx.respond(f"Sync failed (status {status}). Please try again.", ephemeral=True)
 
     @commands.slash_command(
         name="discord_unlink",
