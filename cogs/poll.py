@@ -423,6 +423,15 @@ class PollCog(commands.Cog):
             await ctx.respond("Invalid preference_duration. Minimum is 1 minute.", ephemeral=True)
             return
 
+        # Validate proposal_id format before embedding it in a URL path to
+        # prevent query-string or fragment injection (e.g. "PROP-X?evil=1").
+        if not re.fullmatch(r'[A-Za-z0-9_-]+', proposal_id):
+            await ctx.respond(
+                "Invalid proposal ID format. Expected something like `PROP-A4F2`.",
+                ephemeral=True,
+            )
+            return
+
         # Pre-fetch the proposal so the poll title/embed can include details
         # before round-tripping through the local DB.
         proposal = await _interspace_get(f"/api/proposals/{proposal_id}")
