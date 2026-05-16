@@ -21,6 +21,10 @@ Unlinking:
   * ``/discord_unlink`` — calls the bot-auth endpoint
     ``/api/discord/link/unlink-by-discord-id`` so the user doesn't have
     to roundtrip through Interspace to drop the binding.
+
+Recovery (requires Interspace backend with matching routes + ``BOT_SECRET``):
+  * ``/recover_masterid`` → ``POST /api/discord/recover-master-id`` — ephemeral reply with Master ID.
+  * ``/recover_password`` → ``POST /api/discord/recover-password`` — ephemeral temp password (+ Master ID).
 """
 
 import asyncio
@@ -43,6 +47,14 @@ INTERSPACE_TRACKED_ROLES_LC = {
     "the format council",
 }
 ACTIVE_ROLE_NAME = "active"
+
+
+def _discord_username_for_payload(user: discord.Member | discord.User) -> str:
+    """Human-readable Discord name for Interspace profile sync (matches /discord_link convention)."""
+    name = getattr(user, "global_name", None) or getattr(user, "name", None) or str(user)
+    if getattr(user, "discriminator", "0") not in ("0", "", None):
+        return f"{name}#{user.discriminator}"
+    return str(name)
 
 
 def _collect_member_roles(member: discord.Member | None) -> tuple[list[str], bool]:
@@ -132,6 +144,7 @@ class LinkCog(commands.Cog):
                         "discordId": str(member.id),
                         "roles": tracked,
                         "isActive": is_active,
+                        "discordUsername": _discord_username_for_payload(member),
                     },
                 )
                 if status == 0:
@@ -175,6 +188,7 @@ class LinkCog(commands.Cog):
                     "discordId": str(member.id),
                     "roles": tracked,
                     "isActive": is_active,
+                    "discordUsername": _discord_username_for_payload(member),
                 },
             )
             count += 1
@@ -211,11 +225,7 @@ class LinkCog(commands.Cog):
             return
 
         await ctx.defer(ephemeral=True)
-        # Build a stable, human-friendly Discord username string. Modern usernames
-        # have no discriminator, so prefer ``name`` and fall back to legacy form.
-        discord_username = getattr(ctx.author, "name", str(ctx.author))
-        if getattr(ctx.author, "discriminator", "0") not in ("0", "", None):
-            discord_username = f"{discord_username}#{ctx.author.discriminator}"
+        discord_username = _discord_username_for_payload(ctx.author)
 
         # Snapshot the user's current Discord roles + @active state so Interspace
         # can grant matching roles immediately on link instead of waiting for the
@@ -241,11 +251,18 @@ class LinkCog(commands.Cog):
             )
             return
         if status == 200 and body and body.get("ok"):
-            await ctx.respond(
-                f"Linked to Interspace user **{body.get('username') or body.get('masterID')}**. "
-                f"Your activity on Discord and Interspace now keep each other in sync.",
-                ephemeral=True,
+            mid = body.get("masterID") or "—"
+            uname = body.get("username") or ""
+            label = uname if uname else mid
+            text = (
+                f"Linked to Interspace account **{label}**.\n\n"
+                f"Your Interspace **Master ID** — save this (sign-in and verification use it):\n"
+                f"```{mid}```\n\n"
+                "If your Discord roles updated your structural ID, you also get a confirmation in "
+                "your Interspace notifications.\n"
+                "Your activity on Discord and Interspace stays in sync for **@active**."
             )
+            await ctx.respond(text, ephemeral=True)
             return
         if status == 404:
             await ctx.respond(
@@ -295,6 +312,7 @@ class LinkCog(commands.Cog):
                 "discordId": str(after.id),
                 "roles": after_tracked,
                 "isActive": after_active,
+                "discordUsername": _discord_username_for_payload(after),
             },
         )
         # Mirror @active removal explicitly so Interspace can drop the user
@@ -340,6 +358,7 @@ class LinkCog(commands.Cog):
                 "discordId": str(ctx.author.id),
                 "roles": tracked,
                 "isActive": is_active,
+                "discordUsername": _discord_username_for_payload(member),
             },
         )
 
@@ -369,6 +388,118 @@ class LinkCog(commands.Cog):
             return
 
         await ctx.respond(f"Sync failed (status {status}). Please try again.", ephemeral=True)
+
+    @commands.slash_command(
+        name="recover_masterid",
+        description="Show your linked Interspace Master ID (private — only you see this).",
+    )
+    async def recover_masterid(self, ctx: discord.ApplicationContext) -> None:
+        if not INTERSPACE_URL or not INTERSPACE_BOT_SECRET:
+            await ctx.respond(
+                "Interspace integration is not configured on this bot.",
+                ephemeral=True,
+            )
+            return
+        if not ctx.author:
+            await ctx.respond("Cannot resolve your Discord identity.", ephemeral=True)
+            return
+
+        await ctx.defer(ephemeral=True)
+        status, body = await _interspace_post(
+            "/api/discord/recover-master-id",
+            {"discordId": str(ctx.author.id)},
+        )
+        if status == 0:
+            await ctx.respond(
+                "Could not reach Interspace. Try again in a minute.",
+                ephemeral=True,
+            )
+            return
+        if status == 429:
+            msg = (body or {}).get("error", "Too many attempts — wait a moment and try again.")
+            await ctx.respond(msg, ephemeral=True)
+            return
+        if status == 200 and body:
+            if not body.get("ok"):
+                await ctx.respond(
+                    body.get("hint")
+                    or "No linked Interspace account found. Link in Interspace (Settings → Account), "
+                    "then generate a `/discord_link` code here.",
+                    ephemeral=True,
+                )
+                return
+            mid = body.get("masterID", "")
+            await ctx.respond(
+                "Your Interspace **Master ID**:\n"
+                f"```{mid}```\n\n"
+                f"{body.get('hint') or ''}".strip(),
+                ephemeral=True,
+            )
+            return
+        await ctx.respond(
+            "Recovery failed — try again or contact staff.",
+            ephemeral=True,
+        )
+
+    @commands.slash_command(
+        name="recover_password",
+        description="Get a temporary Interspace login password (private — change it immediately on the site).",
+    )
+    async def recover_password(self, ctx: discord.ApplicationContext) -> None:
+        if not INTERSPACE_URL or not INTERSPACE_BOT_SECRET:
+            await ctx.respond(
+                "Interspace integration is not configured on this bot.",
+                ephemeral=True,
+            )
+            return
+        if not ctx.author:
+            await ctx.respond("Cannot resolve your Discord identity.", ephemeral=True)
+            return
+
+        await ctx.defer(ephemeral=True)
+        status, body = await _interspace_post(
+            "/api/discord/recover-password",
+            {"discordId": str(ctx.author.id)},
+        )
+        if status == 0:
+            await ctx.respond(
+                "Could not reach Interspace. Try again in a minute.",
+                ephemeral=True,
+            )
+            return
+        if status == 429:
+            msg = (body or {}).get("error", "Too many resets — wait a couple of minutes.")
+            await ctx.respond(msg, ephemeral=True)
+            return
+        if status == 200 and body:
+            if not body.get("ok"):
+                err = (
+                    body.get("error")
+                    or body.get("hint")
+                    or "This account can't reset via Discord."
+                )
+                await ctx.respond(err, ephemeral=True)
+                return
+            mid = body.get("masterID", "")
+            pwd = body.get("tempPassword", "")
+            if not pwd:
+                await ctx.respond(
+                    "Interspace returned an empty password — contact staff.",
+                    ephemeral=True,
+                )
+                return
+            await ctx.respond(
+                "**Temporary login password** (sign in once, then change it in Interspace → Settings → Account):\n"
+                f"```{pwd}```\n\n"
+                f"Master ID:\n```{mid}```\n\n"
+                f"{body.get('hint') or ''}".strip(),
+                ephemeral=True,
+            )
+            return
+        await ctx.respond(
+            "Recovery failed — try again or contact staff.",
+            ephemeral=True,
+        )
 
     @commands.slash_command(
         name="discord_unlink",
