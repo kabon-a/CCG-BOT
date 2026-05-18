@@ -11,9 +11,8 @@ This cog handles:
   - /poll preference_create → unchanged simple reaction poll (no Interspace).
   - Background task     → auto-closes expired polls; fetches results from Interspace.
 
-Petition Hall:
-  When Interspace approves a proposal it can be re-posted by the bot to the
-  configured channel "🏰-the-petition-hall" using `post_to_petition_hall`.
+Petition Hall duplicate posts was removed — Interspace emits the webhook when a
+proposal is approved; the bot no longer mirrors it during /poll stage_create.
 
 Removed: /poll stage_vote (voting is now done on the Interspace web UI).
 Removed parameters from stage_create: proposal_type, proposal_text, roles
@@ -93,6 +92,30 @@ async def _interspace_post(path: str, payload: dict) -> dict | None:
                 return None
     except Exception as exc:
         print(f"[Interspace] POST {path} failed: {exc}")
+        return None
+
+
+async def _interspace_delete(path: str) -> dict | None:
+    """DELETE on Interspace (removes mirrored stage poll rows)."""
+    if not INTERSPACE_URL or not INTERSPACE_BOT_SECRET:
+        return None
+    url = f"{INTERSPACE_URL}{path}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {"x-bot-secret": INTERSPACE_BOT_SECRET}
+            async with session.delete(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                text = await resp.text()
+                if resp.status == 404:
+                    return None
+                if resp.status in (200, 204):
+                    try:
+                        return json.loads(text) if text.strip() else {}
+                    except json.JSONDecodeError:
+                        return {}
+                print(f"[Interspace] DELETE {path} → {resp.status}: {text[:200]}")
+                return None
+    except Exception as exc:
+        print(f"[Interspace] DELETE {path} failed: {exc}")
         return None
 
 
@@ -524,9 +547,6 @@ class PollCog(commands.Cog):
         )
         await ctx.channel.send(embed=embed)
 
-        # Also drop a copy into the petition hall in the requested format.
-        await post_to_petition_hall(ctx.guild, proposal)
-
         await ctx.respond(f"Two-stage poll created with ID `{poll_id}` for proposal `{proposal_id}`.", ephemeral=True)
 
     @poll_group.command(name="stage_close", description="Close Stage 1 and fetch/post results from Interspace.")
@@ -603,8 +623,6 @@ class PollCog(commands.Cog):
         needs_stage2 = result.get("needsStage2", False)
         new_status = result.get("status", "failed_stage1")
 
-        await db.set_stage_poll_status(poll_id, new_status)
-
         report_text = "\n".join(report_lines)
         embed = discord.Embed(
             title=f"📊 Stage 1 Results: {poll['title']} (ID {poll_id})",
@@ -623,7 +641,10 @@ class PollCog(commands.Cog):
         if needs_stage2:
             pref_closes_at = result.get("preferenceClosesAt")
             await db.set_stage_poll_status(poll_id, "preference_open",
-                                           preference_options=result.get("stage2OptionIndices", []))
+                                           preference_options=result.get("stage2OptionIndices", []),
+                                           closes_at=pref_closes_at)
+        else:
+            await db.set_stage_poll_status(poll_id, new_status)
 
     async def _close_preference_and_post(
         self,
@@ -742,20 +763,46 @@ class PollCog(commands.Cog):
             return
 
         poll = await db.get_poll_by_id(poll_id)
-        if not poll or poll["guild_id"] != ctx.guild.id:
-            await ctx.respond(f"No poll with ID **{poll_id}** in this server.", ephemeral=True)
+        if poll and int(poll["guild_id"]) == ctx.guild.id:
+            if delete_message:
+                channel = ctx.guild.get_channel(poll["channel_id"])
+                if channel and isinstance(channel, discord.TextChannel):
+                    try:
+                        msg = await channel.fetch_message(poll["message_id"])
+                        await msg.delete()
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass
+            await db.delete_poll(poll_id)
+            await self._refresh_live_status_messages(ctx.guild.id, "regular", poll_id)
+            await ctx.respond(f"Poll **{poll_id}** removed.", ephemeral=True)
             return
-        if delete_message:
-            channel = ctx.guild.get_channel(poll["channel_id"])
-            if channel and isinstance(channel, discord.TextChannel):
-                try:
-                    msg = await channel.fetch_message(poll["message_id"])
-                    await msg.delete()
-                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                    pass
-        await db.delete_poll(poll_id)
-        await self._refresh_live_status_messages(ctx.guild.id, "regular", poll_id)
-        await ctx.respond(f"Poll **{poll_id}** removed.", ephemeral=True)
+
+        stage = await db.get_stage_poll_by_id(poll_id)
+        if stage and int(stage["guild_id"]) == ctx.guild.id:
+            interspace_poll_id = f"stage-{poll_id}"
+            await _interspace_delete(f"/api/polls/{interspace_poll_id}")
+
+            delete_stage_fn = getattr(db, "delete_stage_poll", None)
+            if callable(delete_stage_fn):
+                await delete_stage_fn(poll_id)
+            elif hasattr(db, "delete_stage_poll_by_id"):
+                await db.delete_stage_poll_by_id(poll_id)  # type: ignore[misc]
+
+            if delete_message:
+                channel = ctx.guild.get_channel(stage.get("channel_id"))
+                mid = stage.get("message_id")
+                if channel and isinstance(channel, discord.TextChannel) and mid:
+                    try:
+                        msg = await channel.fetch_message(int(mid))
+                        await msg.delete()
+                    except (ValueError, TypeError, discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass
+
+            await self._refresh_live_status_messages(ctx.guild.id, "stage", poll_id)
+            await ctx.respond(f"Stage poll **{poll_id}** removed from Interspace and this server.", ephemeral=True)
+            return
+
+        await ctx.respond(f"No poll with ID **{poll_id}** in this server.", ephemeral=True)
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
