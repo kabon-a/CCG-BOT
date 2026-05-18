@@ -136,7 +136,7 @@ async def _remove_stale_active_impl(bot: commands.Bot) -> None:
     Anyone present in the Interspace pulse is refreshed locally and kept.
     """
     pulse = await _interspace_get(
-        f"/api/discord/active-pulse?since=0",
+        f"/api/discord/active-pulse?since={int((discord.utils.utcnow().timestamp() - 7 * 24 * 3600) * 1000)}",
     ) or {}
     web_active_ids = {
         int(u["discordId"]) for u in pulse.get("users", [])
@@ -171,7 +171,7 @@ async def _pull_interspace_activity_impl(bot: commands.Bot) -> None:
     the user requirement: "users gain the active role by participating
     in the interspace".
     """
-    pulse = await _interspace_get("/api/discord/active-pulse?since=0")
+    pulse = await _interspace_get("/api/discord/active-pulse?since={int((discord.utils.utcnow().timestamp() - 7 * 24 * 3600) * 1000)}")
     if not pulse:
         return
     for entry in pulse.get("users", []):
