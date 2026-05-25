@@ -1,21 +1,30 @@
-"""Active cog — assign @active role to users with recent activity (within 7 days).
+"""Active cog — assign @active role to users with recent activity.
 
-Activity is recorded on two criteria:
-  * messages or reactions in the designated courtroom channel
-  * admin-approved /record_match submissions
+A user qualifies for @active by satisfying **either** of these two criteria:
 
-Every grant also pings Interspace via ``/api/discord/active-ping`` so that
-linked Interspace users count toward the 65% poll-quorum on the web side.
+  1. Interacting in the ❗❗-the-courtroom forum channel (posting, replying,
+     or reacting in the forum itself or any thread inside it) within the
+     last 10 days.
+  2. Having a /record_match submission confirmed by an admin within the
+     last 7 days.
 
-A periodic task pulls ``/api/discord/active-pulse`` from Interspace, which
-returns every linked Discord user who has been active on the *Interspace*
-in the past 7 days. We then grant @active to those Discord users, mirroring
-their web activity onto Discord — without that, somebody who only ever uses
-Interspace would lose @active and be excluded from poll quorums.
+The role is removed only when *both* windows have expired. A daily cleanup
+loop sweeps stale grants.
+
+Outbound mirror: each grant also fires a best-effort ping at Interspace
+(``/api/discord/active-ping``) so linked web users count toward the
+Interspace-side 65% poll quorum. The outbound ping never decides who gets
+@active on Discord — that's strictly governed by the two criteria above.
 """
 
-from __future__ import annotations
+# NOTE: Do NOT add `from __future__ import annotations` to this file.
+# Py-cord introspects slash-command parameter annotations at runtime to build
+# option types. With PEP 563 enabled, `replay: str` becomes the *string* "str"
+# instead of the class `str`, and py-cord's internal `issubclass(op._raw_type,
+# Enum)` then raises `TypeError: issubclass() arg 1 must be a class`, killing
+# /record_match with an ApplicationCommandInvokeError.
 
+import time
 from typing import Dict
 
 import aiohttp
@@ -27,14 +36,23 @@ from config import INTERSPACE_URL, INTERSPACE_BOT_SECRET
 
 ACTIVE_ROLE_NAME = "active"
 COURTROOM_CHANNEL_NAME = "❗❗-the-courtroom"
-INTERSPACE_PULSE_INTERVAL_MINUTES = 5
 
 APPROVE_EMOJI = "✅"
 REJECT_EMOJI = "❌"
 
+# Grant sources — kept as constants so callers don't pass magic strings.
+SOURCE_COURTROOM = "courtroom"
+SOURCE_MATCH = "match"
+
 
 def setup(bot: commands.Bot) -> None:
     bot.add_cog(ActiveCog(bot))
+
+
+# ── Interspace outbound mirror ──────────────────────────────────────────────
+#
+# Only outbound — we never *pull* @active from Interspace. The two local
+# criteria are the sole source of truth for who holds @active on Discord.
 
 
 def _interspace_headers() -> dict:
@@ -59,22 +77,41 @@ async def _interspace_post(path: str, payload: dict) -> dict | None:
         return None
 
 
-async def _interspace_get(path: str) -> dict | None:
-    if not INTERSPACE_URL or not INTERSPACE_BOT_SECRET:
-        return None
-    url = f"{INTERSPACE_URL}{path}"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url, headers=_interspace_headers(),
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                return None
-    except Exception as exc:  # pragma: no cover
-        print(f"[Interspace] GET {path} failed: {exc}")
-        return None
+# ── Channel matching ────────────────────────────────────────────────────────
+
+
+def _is_courtroom_channel(channel: object) -> bool:
+    """True if ``channel`` is the courtroom forum or a thread inside it.
+
+    The courtroom is a Discord forum channel, so user messages live in child
+    threads whose ``.name`` is the thread title (not the forum name). We
+    match against the thread's parent forum in that case.
+    """
+    if channel is None:
+        return False
+    if getattr(channel, "name", None) == COURTROOM_CHANNEL_NAME:
+        return True
+    parent = getattr(channel, "parent", None)
+    if parent is not None and getattr(parent, "name", None) == COURTROOM_CHANNEL_NAME:
+        return True
+    return False
+
+
+def _resolve_channel_or_thread(
+    guild: discord.Guild, channel_id: int,
+) -> object | None:
+    """Resolve a raw channel_id to a top-level channel *or* a thread."""
+    ch = guild.get_channel(channel_id)
+    if ch is not None:
+        return ch
+    # Forum/text-channel threads aren't returned by get_channel.
+    getter = getattr(guild, "get_thread", None)
+    if callable(getter):
+        return getter(channel_id)
+    return None
+
+
+# ── Role plumbing ───────────────────────────────────────────────────────────
 
 
 async def ensure_active_role(guild: discord.Guild) -> discord.Role | None:
@@ -83,43 +120,49 @@ async def ensure_active_role(guild: discord.Guild) -> discord.Role | None:
     if role:
         return role
     try:
-        role = await guild.create_role(
+        return await guild.create_role(
             name=ACTIVE_ROLE_NAME,
-            reason="Active member tracking (courtroom policies)",
+            reason="Active member tracking (courtroom + match policies)",
         )
-        return role
     except discord.Forbidden:
         return None
 
 
-async def grant_active_and_record(
+async def grant_active(
     guild: discord.Guild,
     user: discord.Member | discord.User,
+    *,
+    source: str,
 ) -> None:
-    """Grant @active role and record activity. Idempotent.
+    """Stamp activity for the given source and ensure @active is assigned.
 
-    Also pings Interspace so the linked user (if any) is counted as active
-    on the web side. The Interspace ping is fire-and-forget — we never let
-    a network blip block the local @active assignment.
+    ``source`` must be ``SOURCE_COURTROOM`` or ``SOURCE_MATCH``. Each source
+    writes to its own timestamp so the two freshness windows can decay
+    independently. Idempotent — safe to call repeatedly.
     """
-    if not guild or not user:
-        return
-    if user.bot:
+    if not guild or not user or user.bot:
         return
     member = guild.get_member(user.id) if isinstance(user, discord.User) else user
     if not member:
         return
-    await db.record_activity(guild.id, user.id)
+
+    if source == SOURCE_COURTROOM:
+        await db.record_courtroom_activity(guild.id, user.id)
+    elif source == SOURCE_MATCH:
+        await db.record_match_activity(guild.id, user.id)
+    else:
+        return
+
     role = await ensure_active_role(guild)
     if role and role not in member.roles:
         try:
-            await member.add_roles(role, reason="Activity recorded")
+            await member.add_roles(role, reason=f"Active ({source})")
         except discord.Forbidden:
             pass
 
-    # Cross-platform mirror: tell Interspace this Discord user just was active.
-    # Only meaningful if they've linked their Interspace account, but the
-    # endpoint silently no-ops for unlinked users so we don't gate on that.
+    # Outbound mirror: tell Interspace this Discord user just was active so a
+    # linked Interspace account is counted toward web-side poll quorum. Never
+    # affects the local grant decision; failures are swallowed.
     try:
         await _interspace_post("/api/discord/active-ping", {"discordId": str(user.id)})
     except Exception:
@@ -127,67 +170,20 @@ async def grant_active_and_record(
 
 
 async def _remove_stale_active_impl(bot: commands.Bot) -> None:
-    """Remove @active from users with no activity in 7+ days.
-
-    Note: ``db.get_user_ids_to_remove_active`` only inspects local Discord
-    activity. Before stripping the role, we pull
-    ``/api/discord/active-pulse`` to see if Interspace still considers
-    these users active (e.g. they've been participating only on the web).
-    Anyone present in the Interspace pulse is refreshed locally and kept.
-    """
-    pulse = await _interspace_get(
-        f"/api/discord/active-pulse?since={int((discord.utils.utcnow().timestamp() - 7 * 24 * 3600) * 1000)}",
-    ) or {}
-    web_active_ids = {
-        int(u["discordId"]) for u in pulse.get("users", [])
-        if u.get("discordId") and str(u["discordId"]).isdigit()
-    }
-
+    """Strip @active from users with no activity in either window."""
     for guild in bot.guilds:
         role = discord.utils.get(guild.roles, name=ACTIVE_ROLE_NAME)
         if not role:
             continue
         to_remove = await db.get_user_ids_to_remove_active(guild.id)
         for uid in to_remove:
-            if uid in web_active_ids:
-                # Refresh local timestamp from web-side activity so the user
-                # keeps @active.
-                await db.record_activity(guild.id, uid)
-                continue
             member = guild.get_member(uid)
             if member and role in member.roles:
                 try:
-                    await member.remove_roles(role, reason="No activity in 7 days")
-                except discord.Forbidden:
-                    pass
-
-
-async def _pull_interspace_activity_impl(bot: commands.Bot) -> None:
-    """Pull Interspace activity into Discord @active grants.
-
-    Every ``INTERSPACE_PULSE_INTERVAL_MINUTES`` minutes we fetch every
-    linked Discord user that has been active on the Interspace in the
-    past 7 days and grant them @active locally. This is what enforces
-    the user requirement: "users gain the active role by participating
-    in the interspace".
-    """
-    pulse = await _interspace_get("/api/discord/active-pulse?since={int((discord.utils.utcnow().timestamp() - 7 * 24 * 3600) * 1000)}")
-    if not pulse:
-        return
-    for entry in pulse.get("users", []):
-        raw_id = entry.get("discordId")
-        if not raw_id or not str(raw_id).isdigit():
-            continue
-        discord_id = int(raw_id)
-        for guild in bot.guilds:
-            member = guild.get_member(discord_id)
-            if not member:
-                continue
-            await db.record_activity(guild.id, discord_id)
-            role = await ensure_active_role(guild)
-            if role and role not in member.roles:
-                try:
-                    await member.add_roles(role, reason="Active on Interspace")
+                    await member.remove_roles(
+                        role,
+                        reason="No courtroom (10d) or confirmed-match (7d) activity",
+                    )
                 except discord.Forbidden:
                     pass
 
@@ -195,7 +191,7 @@ async def _pull_interspace_activity_impl(bot: commands.Bot) -> None:
 class ActiveCog(commands.Cog):
     """Assigns @active to users with recent activity. Removes from inactive users."""
 
-    # Pending approvals expire after 24 h so the dict never grows unbounded.
+    # Pending match approvals expire after 24 h so the dict never grows unbounded.
     PENDING_APPROVAL_TTL_SECONDS = 86_400
 
     def __init__(self, bot: commands.Bot) -> None:
@@ -203,7 +199,7 @@ class ActiveCog(commands.Cog):
         # message_id → { "guild_id": int, "user_id": int, "replay": str, "created_at": float }
         self._pending_match_approvals: Dict[int, dict] = {}
 
-    # ── Periodic tasks ──────────────────────────────────────────────────────────
+    # ── Periodic tasks ──────────────────────────────────────────────────────
 
     @tasks.loop(hours=24)
     async def cleanup_stale_active(self) -> None:
@@ -212,65 +208,49 @@ class ActiveCog(commands.Cog):
 
     def _prune_stale_match_approvals(self) -> None:
         """Remove pending match approval entries older than TTL."""
-        import time
         cutoff = time.time() - self.PENDING_APPROVAL_TTL_SECONDS
-        stale = [k for k, v in self._pending_match_approvals.items() if v.get("created_at", 0) < cutoff]
+        stale = [
+            k for k, v in self._pending_match_approvals.items()
+            if v.get("created_at", 0) < cutoff
+        ]
         for k in stale:
             del self._pending_match_approvals[k]
-
-    @tasks.loop(minutes=INTERSPACE_PULSE_INTERVAL_MINUTES)
-    async def pull_interspace_activity(self) -> None:
-        await _pull_interspace_activity_impl(self.bot)
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
         if not self.cleanup_stale_active.is_running():
             self.cleanup_stale_active.start()
-        if not self.pull_interspace_activity.is_running():
-            self.pull_interspace_activity.start()
 
-    # ── Activity listeners (courtroom-only) ─────────────────────────────────────
+    # ── Courtroom listeners ─────────────────────────────────────────────────
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
-        if not message.guild or not message.author:
+        if not message.guild or not message.author or message.author.bot:
             return
-        if message.channel.name != COURTROOM_CHANNEL_NAME:
+        if not _is_courtroom_channel(message.channel):
             return
-        await grant_active_and_record(message.guild, message.author)
-
-    @commands.Cog.listener()
-    async def on_reaction_add(
-        self,
-        reaction: discord.Reaction,
-        user: discord.User | discord.Member,
-    ) -> None:
-        if not reaction.message.guild or not user:
-            return
-        if reaction.message.channel.name != COURTROOM_CHANNEL_NAME:
-            return
-        await grant_active_and_record(reaction.message.guild, user)
+        await grant_active(message.guild, message.author, source=SOURCE_COURTROOM)
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
-        guild = self.bot.get_guild(payload.guild_id)
+        guild = self.bot.get_guild(payload.guild_id) if payload.guild_id else None
         if not guild:
             return
 
-        # Check if this reaction is an admin approval/rejection for a pending match
+        # Admin ✅/❌ on a pending /record_match approval message is handled
+        # separately — it doesn't itself count as courtroom activity.
         if payload.message_id in self._pending_match_approvals:
             await self._handle_match_reaction(guild, payload)
             return
 
-        # Only grant @active for reactions in the courtroom channel
-        channel = guild.get_channel(payload.channel_id)
-        if not channel or getattr(channel, 'name', None) != COURTROOM_CHANNEL_NAME:
+        channel = _resolve_channel_or_thread(guild, payload.channel_id)
+        if not _is_courtroom_channel(channel):
             return
         user = self.bot.get_user(payload.user_id)
         if user:
-            await grant_active_and_record(guild, user)
+            await grant_active(guild, user, source=SOURCE_COURTROOM)
 
-    # ── /record_match command ────────────────────────────────────────────────────
+    # ── /record_match command ───────────────────────────────────────────────
 
     @commands.slash_command(
         name="record_match",
@@ -283,9 +263,14 @@ class ActiveCog(commands.Cog):
 
         # Strip Discord markdown special characters from user-supplied replay
         # string to prevent formatting injection in the embed description.
-        safe_replay = (replay or "").replace("`", "\\`").replace("*", "\\*").replace("_", "\\_").replace("~", "\\~")
+        safe_replay = (
+            (replay or "")
+            .replace("`", "\\`")
+            .replace("*", "\\*")
+            .replace("_", "\\_")
+            .replace("~", "\\~")
+        )
 
-        # Post a pending-approval message that admins can ✅/❌
         embed = discord.Embed(
             title="Match Replay — Pending Approval",
             description=f"**Submitted by:** {ctx.author.mention}\n**Replay:** {safe_replay}",
@@ -296,8 +281,6 @@ class ActiveCog(commands.Cog):
         await ctx.respond(embed=embed)
         msg = await ctx.interaction.original_response()
 
-        import time
-        # Store the pending entry keyed by the bot's reply message ID
         self._pending_match_approvals[msg.id] = {
             "guild_id": ctx.guild.id,
             "user_id": ctx.author.id,
@@ -305,7 +288,6 @@ class ActiveCog(commands.Cog):
             "created_at": time.time(),
         }
 
-        # Add reaction prompts so admins can one-click approve/reject
         try:
             await msg.add_reaction(APPROVE_EMOJI)
             await msg.add_reaction(REJECT_EMOJI)
@@ -322,7 +304,6 @@ class ActiveCog(commands.Cog):
         if not entry:
             return
 
-        # Only admins (members with administrator permission) may approve/reject
         reactor = guild.get_member(payload.user_id)
         if not reactor or reactor.bot:
             return
@@ -333,20 +314,22 @@ class ActiveCog(commands.Cog):
         if emoji not in (APPROVE_EMOJI, REJECT_EMOJI):
             return
 
-        # Consume the entry regardless of outcome
         del self._pending_match_approvals[payload.message_id]
 
-        channel = guild.get_channel(payload.channel_id)
+        channel = _resolve_channel_or_thread(guild, payload.channel_id)
         try:
-            msg = await channel.fetch_message(payload.message_id)
+            msg = await channel.fetch_message(payload.message_id) if channel else None
         except Exception:
             msg = None
 
         if emoji == APPROVE_EMOJI:
             target = guild.get_member(entry["user_id"])
             if target:
-                await grant_active_and_record(guild, target)
-            result_text = f"✅ Approved by {reactor.mention}. @active granted to <@{entry['user_id']}>."
+                await grant_active(guild, target, source=SOURCE_MATCH)
+            result_text = (
+                f"✅ Approved by {reactor.mention}. "
+                f"@active granted to <@{entry['user_id']}>."
+            )
         else:
             result_text = f"❌ Rejected by {reactor.mention}."
 
@@ -354,7 +337,8 @@ class ActiveCog(commands.Cog):
             try:
                 await msg.edit(
                     embed=discord.Embed(
-                        title="Match Replay — " + ("Approved" if emoji == APPROVE_EMOJI else "Rejected"),
+                        title="Match Replay — "
+                        + ("Approved" if emoji == APPROVE_EMOJI else "Rejected"),
                         description=msg.embeds[0].description if msg.embeds else "",
                         colour=discord.Colour.green() if emoji == APPROVE_EMOJI else discord.Colour.red(),
                     ).set_footer(text=result_text)

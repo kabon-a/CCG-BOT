@@ -30,7 +30,6 @@ from discord import Option
 from discord.ext import commands, tasks
 
 import database as db
-from cogs.active import grant_active_and_record
 from config import INTERSPACE_URL, INTERSPACE_BOT_SECRET
 
 POLL_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
@@ -824,10 +823,6 @@ class PollCog(commands.Cog):
             return
         if add:
             await db.add_poll_vote(poll["id"], payload.user_id, option_index)
-            guild = self.bot.get_guild(payload.guild_id)
-            user = self.bot.get_user(payload.user_id)
-            if guild and user:
-                await grant_active_and_record(guild, user)
         else:
             await db.remove_poll_vote(poll["id"], payload.user_id, option_index)
         if payload.guild_id:

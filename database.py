@@ -341,17 +341,25 @@ async def init_db() -> None:
             )
         """)
 
-        # Active users (for @active role, last_activity within 7 days)
+        # Active users (for @active role). Two independent sources, each with
+        # its own freshness window — courtroom interaction (10 days) and
+        # admin-confirmed /record_match submissions (7 days). The legacy
+        # ``last_activity`` column is retained for backward compatibility but
+        # no longer queried by the new grant logic.
         await db.execute("""
             CREATE TABLE IF NOT EXISTS active_users (
                 guild_id INTEGER NOT NULL,
                 user_id INTEGER NOT NULL,
                 last_activity REAL NOT NULL,
+                last_courtroom_at REAL,
+                last_match_at REAL,
                 PRIMARY KEY (guild_id, user_id)
             )
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_active_users_guild ON active_users(guild_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_active_users_activity ON active_users(last_activity)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_active_users_courtroom ON active_users(last_courtroom_at)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_active_users_match ON active_users(last_match_at)")
 
         # Polls (custom polls with reactions, not Discord native)
         await db.execute("""
@@ -495,6 +503,22 @@ async def init_db() -> None:
             await db.execute(
                 "ALTER TABLE archetypes ADD COLUMN total_aa_matches INTEGER NOT NULL DEFAULT 0"
             )
+        except aiosqlite.OperationalError:
+            pass
+
+        # Migration: split single `last_activity` into per-source timestamps so
+        # courtroom (10d) and confirmed-match (7d) windows can be tracked
+        # independently. On first apply we seed `last_courtroom_at` from
+        # `last_activity` so currently-@active members aren't surprise-demoted.
+        try:
+            await db.execute("ALTER TABLE active_users ADD COLUMN last_courtroom_at REAL")
+            await db.execute(
+                "UPDATE active_users SET last_courtroom_at = last_activity WHERE last_courtroom_at IS NULL"
+            )
+        except aiosqlite.OperationalError:
+            pass
+        try:
+            await db.execute("ALTER TABLE active_users ADD COLUMN last_match_at REAL")
         except aiosqlite.OperationalError:
             pass
 
@@ -1307,42 +1331,91 @@ async def list_live_poll_status_targets() -> list[tuple[int, str, int]]:
 
 
 # --- Active users (for @active role) ---
+#
+# Two independent grant criteria:
+#   * courtroom interaction (messages/reactions in the ❗❗-the-courtroom forum
+#     or any of its threads) within the last 10 days
+#   * /record_match submission confirmed by an admin within the last 7 days
+#
+# A user holds @active iff at least one of those timestamps is inside its
+# window. The role is removed only when BOTH windows have expired.
 
-ACTIVE_WINDOW_SECONDS = 7 * 24 * 60 * 60  # 7 days
+COURTROOM_WINDOW_SECONDS = 10 * 24 * 60 * 60  # 10 days
+MATCH_WINDOW_SECONDS = 7 * 24 * 60 * 60  # 7 days
 
 
-async def record_activity(guild_id: int, user_id: int) -> None:
-    """Record or update last activity for a user in a guild."""
+async def record_courtroom_activity(guild_id: int, user_id: int) -> None:
+    """Stamp a user as having interacted in the courtroom forum just now."""
     now = time.time()
     async with aiosqlite.connect(DATABASE_PATH) as conn:
         await conn.execute(
             """
-            INSERT INTO active_users (guild_id, user_id, last_activity) VALUES (?, ?, ?)
-            ON CONFLICT (guild_id, user_id) DO UPDATE SET last_activity = excluded.last_activity
+            INSERT INTO active_users (guild_id, user_id, last_activity, last_courtroom_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                last_activity = excluded.last_activity,
+                last_courtroom_at = excluded.last_courtroom_at
             """,
-            (guild_id, user_id, now),
+            (guild_id, user_id, now, now),
+        )
+        await conn.commit()
+
+
+async def record_match_activity(guild_id: int, user_id: int) -> None:
+    """Stamp a user as having an admin-confirmed match just now."""
+    now = time.time()
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        await conn.execute(
+            """
+            INSERT INTO active_users (guild_id, user_id, last_activity, last_match_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                last_activity = excluded.last_activity,
+                last_match_at = excluded.last_match_at
+            """,
+            (guild_id, user_id, now, now),
         )
         await conn.commit()
 
 
 async def get_active_user_ids(guild_id: int) -> set[int]:
-    """Return user IDs with activity within the last 7 days."""
-    cutoff = time.time() - ACTIVE_WINDOW_SECONDS
+    """Return user IDs currently eligible for @active.
+
+    Eligible = courtroom interaction within ``COURTROOM_WINDOW_SECONDS`` OR
+    confirmed match within ``MATCH_WINDOW_SECONDS``.
+    """
+    now = time.time()
+    cr_cutoff = now - COURTROOM_WINDOW_SECONDS
+    mt_cutoff = now - MATCH_WINDOW_SECONDS
     async with aiosqlite.connect(DATABASE_PATH) as conn:
         cur = await conn.execute(
-            "SELECT user_id FROM active_users WHERE guild_id = ? AND last_activity >= ?",
-            (guild_id, cutoff),
+            """
+            SELECT user_id FROM active_users
+            WHERE guild_id = ?
+              AND (
+                (last_courtroom_at IS NOT NULL AND last_courtroom_at >= ?)
+                OR (last_match_at IS NOT NULL AND last_match_at >= ?)
+              )
+            """,
+            (guild_id, cr_cutoff, mt_cutoff),
         )
         return {r[0] for r in await cur.fetchall()}
 
 
 async def get_user_ids_to_remove_active(guild_id: int) -> list[int]:
-    """Return user IDs whose last activity is older than 7 days (for role cleanup)."""
-    cutoff = time.time() - ACTIVE_WINDOW_SECONDS
+    """Return user IDs whose courtroom AND match windows have both expired."""
+    now = time.time()
+    cr_cutoff = now - COURTROOM_WINDOW_SECONDS
+    mt_cutoff = now - MATCH_WINDOW_SECONDS
     async with aiosqlite.connect(DATABASE_PATH) as conn:
         cur = await conn.execute(
-            "SELECT user_id FROM active_users WHERE guild_id = ? AND last_activity < ?",
-            (guild_id, cutoff),
+            """
+            SELECT user_id FROM active_users
+            WHERE guild_id = ?
+              AND (last_courtroom_at IS NULL OR last_courtroom_at < ?)
+              AND (last_match_at IS NULL OR last_match_at < ?)
+            """,
+            (guild_id, cr_cutoff, mt_cutoff),
         )
         return [r[0] for r in await cur.fetchall()]
 
