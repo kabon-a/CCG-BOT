@@ -346,6 +346,11 @@ async def init_db() -> None:
         # admin-confirmed /record_match submissions (7 days). The legacy
         # ``last_activity`` column is retained for backward compatibility but
         # no longer queried by the new grant logic.
+        #
+        # NOTE: indexes on the new columns are created *after* the migration
+        # block below, so that pre-existing databases (whose ``active_users``
+        # table predates these columns) don't try to index a column that
+        # ALTER TABLE hasn't added yet.
         await db.execute("""
             CREATE TABLE IF NOT EXISTS active_users (
                 guild_id INTEGER NOT NULL,
@@ -358,8 +363,6 @@ async def init_db() -> None:
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_active_users_guild ON active_users(guild_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_active_users_activity ON active_users(last_activity)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_active_users_courtroom ON active_users(last_courtroom_at)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_active_users_match ON active_users(last_match_at)")
 
         # Polls (custom polls with reactions, not Discord native)
         await db.execute("""
@@ -521,6 +524,16 @@ async def init_db() -> None:
             await db.execute("ALTER TABLE active_users ADD COLUMN last_match_at REAL")
         except aiosqlite.OperationalError:
             pass
+
+        # Indexes for the per-source columns are created *here*, after the
+        # migration ALTER-TABLE statements have guaranteed the columns exist
+        # on both fresh and pre-existing databases.
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_active_users_courtroom ON active_users(last_courtroom_at)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_active_users_match ON active_users(last_match_at)"
+        )
 
         await db.commit()
 
