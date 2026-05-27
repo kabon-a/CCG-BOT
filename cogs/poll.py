@@ -388,6 +388,10 @@ class PollCog(commands.Cog):
                     await ctx.respond(f"Role **{rname}** not found.", ephemeral=True)
                     return
 
+        # Defer before sending the embed + up to 10 reactions; that loop can
+        # easily blow past Discord's 3 s interaction-response window.
+        await ctx.defer(ephemeral=True)
+
         lines = [f"{POLL_EMOJIS[i]} {opt}" for i, opt in enumerate(opts)]
         embed = discord.Embed(
             title=f"📋 {title}",
@@ -453,6 +457,12 @@ class PollCog(commands.Cog):
                 ephemeral=True,
             )
             return
+
+        # Defer now — we are about to make TWO Interspace HTTP calls (each
+        # 10 s timeout) plus a Discord channel send. That can easily exceed
+        # the 3 s initial-response window and invalidate the interaction
+        # token (NotFound 10062) on the trailing ctx.respond.
+        await ctx.defer(ephemeral=True)
 
         # Pre-fetch the proposal so the poll title/embed can include details
         # before round-tripping through the local DB.
@@ -554,6 +564,7 @@ class PollCog(commands.Cog):
         ctx: discord.ApplicationContext,
         poll_id: Option(int, "Stage poll ID", required=True),
     ) -> None:
+        # Fast pre-flight checks before we burn the 3-second interaction window.
         if not ctx.guild or not ctx.author:
             await ctx.respond("Must be used in a server.", ephemeral=True)
             return
@@ -568,6 +579,15 @@ class PollCog(commands.Cog):
         if poll["status"] != "stage1_open":
             await ctx.respond("Stage 1 is already closed for this poll.", ephemeral=True)
             return
+
+        # Defer NOW — the work below talks to Interspace (10 s timeout) and
+        # edits live status messages, which can easily exceed Discord's 3 s
+        # initial-response window. Without this defer, the final ctx.respond
+        # below raises NotFound 10062 ("Unknown interaction") whenever the
+        # network is slow. After defer, ctx.respond auto-routes through the
+        # followup endpoint and remains valid for up to 15 minutes.
+        await ctx.defer(ephemeral=True)
+
         await self._close_stage1_and_post(ctx.guild, poll, ctx.channel)
         await self._refresh_live_status_messages(ctx.guild.id, "stage", poll_id)
         await ctx.respond("Stage 1 closed and report posted.", ephemeral=True)
@@ -692,6 +712,11 @@ class PollCog(commands.Cog):
             await ctx.respond("Must be used in a server.", ephemeral=True)
             return
 
+        # Building the status embed can do multiple DB reads + (in live mode)
+        # a channel fetch_message + edit/send. Defer to keep the interaction
+        # token alive past the 3 s mark.
+        await ctx.defer(ephemeral=True)
+
         poll = await db.get_poll_by_id(poll_id)
         if poll and poll["guild_id"] == ctx.guild.id:
             embed = await self._build_regular_status_embed(ctx.guild, poll)
@@ -760,6 +785,11 @@ class PollCog(commands.Cog):
         if not (perms.administrator or perms.manage_guild or perms.manage_messages):
             await ctx.respond("You need Administrator, Manage Server, or Manage Messages permission.", ephemeral=True)
             return
+
+        # Defer — the stage-poll branch hits Interspace (10 s timeout) and
+        # both branches may fetch + delete a channel message. Stack high
+        # enough to lose the 3 s initial-response window.
+        await ctx.defer(ephemeral=True)
 
         poll = await db.get_poll_by_id(poll_id)
         if poll and int(poll["guild_id"]) == ctx.guild.id:
