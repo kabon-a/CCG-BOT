@@ -19,9 +19,11 @@ Removed parameters from stage_create: proposal_type, proposal_text, roles
   (role gating now derives from the proposal tier on the Interspace side).
 """
 
+import datetime
 import json
 import math
 import re
+import time
 from statistics import mean
 
 import aiohttp
@@ -70,6 +72,42 @@ def format_duration(seconds: int) -> str:
     if seconds >= 60:
         return f"{seconds // 60}m"
     return f"{seconds}s"
+
+
+def _coerce_epoch_seconds(value) -> float | None:
+    """Normalize an Interspace timestamp to epoch seconds.
+
+    Accepts None, epoch seconds, epoch milliseconds, or an ISO-8601 string
+    (optionally ``Z``-suffixed). Returns None if it can't be parsed. The
+    stage-poll ``preference_ends_at`` column and ``get_pending_preference_polls``
+    both work in epoch seconds, so anything we store here must match.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):  # guard: bool is a subclass of int
+        return None
+    if isinstance(value, (int, float)):
+        v = float(value)
+        # Heuristic: a "seconds" value this large would be year ~33658, so
+        # it's really milliseconds.
+        return v / 1000.0 if v > 1e12 else v
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            v = float(s)
+            return v / 1000.0 if v > 1e12 else v
+        except ValueError:
+            pass
+        try:
+            dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            return dt.timestamp()
+        except ValueError:
+            return None
+    return None
 
 
 def _interspace_headers() -> dict:
@@ -658,10 +696,20 @@ class PollCog(commands.Cog):
         await channel.send(embed=embed)
 
         if needs_stage2:
-            pref_closes_at = result.get("preferenceClosesAt")
-            await db.set_stage_poll_status(poll_id, "preference_open",
-                                           preference_options=result.get("stage2OptionIndices", []),
-                                           closes_at=pref_closes_at)
+            # Normalize Interspace's close time to epoch seconds (it may send an
+            # ISO string or epoch-ms). Fall back to now + the stored preference
+            # duration if it's missing/unparseable, otherwise the Stage 2 poll
+            # would never satisfy `preference_ends_at <= now` and never close.
+            pref_ends_at = _coerce_epoch_seconds(result.get("preferenceClosesAt"))
+            if pref_ends_at is None:
+                pref_dur = int(poll.get("preference_duration_seconds") or 0)
+                pref_ends_at = time.time() + pref_dur if pref_dur > 0 else None
+            await db.set_stage_poll_status(
+                poll_id,
+                "preference_open",
+                preference_options=result.get("stage2OptionIndices", []),
+                preference_ends_at=pref_ends_at,
+            )
         else:
             await db.set_stage_poll_status(poll_id, new_status)
 
@@ -925,50 +973,74 @@ class PollCog(commands.Cog):
         except discord.HTTPException:
             pass
 
+    async def _resolve_text_channel(
+        self, guild: discord.Guild, channel_id: int,
+    ) -> discord.TextChannel | None:
+        channel = guild.get_channel(channel_id)
+        if not channel:
+            try:
+                channel = await guild.fetch_channel(channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return None
+        return channel if isinstance(channel, discord.TextChannel) else None
+
     @tasks.loop(seconds=30)
     async def check_poll_closures(self) -> None:
-        pending = await db.get_pending_polls()
-        for poll in pending:
-            if str(poll.get("title", "")).startswith("[Stage 2] "):
-                continue
-            await self._close_poll(poll)
-            await self._refresh_live_status_messages(int(poll["guild_id"]), "regular", int(poll["id"]))
-            await db.delete_poll(poll["id"])
-
-        pending_stage1 = await db.get_pending_stage1_polls()
-        for poll in pending_stage1:
-            guild = self.bot.get_guild(poll["guild_id"])
-            if not guild:
-                continue
-            channel = guild.get_channel(poll["channel_id"])
-            if not channel:
+        # CRITICAL: every poll is processed in its own try/except, and the whole
+        # sweep is wrapped in a final guard. discord.ext.tasks loops stop
+        # permanently on the first unhandled exception, and all three poll
+        # types share this single loop — so without isolation, one transient
+        # Interspace error (or a single bad row) silently disables automatic
+        # closure for EVERY poll until the bot is restarted.
+        try:
+            for poll in await db.get_pending_polls():
                 try:
-                    channel = await guild.fetch_channel(poll["channel_id"])
-                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                    continue
-            if not channel or not isinstance(channel, discord.TextChannel):
-                continue
-            await self._close_stage1_and_post(guild, poll, channel)
-            await self._refresh_live_status_messages(int(poll["guild_id"]), "stage", int(poll["id"]))
+                    if str(poll.get("title", "")).startswith("[Stage 2] "):
+                        continue
+                    await self._close_poll(poll)
+                    await self._refresh_live_status_messages(int(poll["guild_id"]), "regular", int(poll["id"]))
+                    await db.delete_poll(poll["id"])
+                except Exception as exc:
+                    print(f"[poll] failed to auto-close regular poll {poll.get('id')}: {exc!r}")
 
-        pending_pref = await db.get_pending_preference_polls()
-        for poll in pending_pref:
-            guild = self.bot.get_guild(poll["guild_id"])
-            if not guild:
-                continue
-            channel = guild.get_channel(poll["channel_id"])
-            if not channel:
+            for poll in await db.get_pending_stage1_polls():
                 try:
-                    channel = await guild.fetch_channel(poll["channel_id"])
-                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                    continue
-            if not channel or not isinstance(channel, discord.TextChannel):
-                continue
-            await self._close_preference_and_post(guild, poll, channel)
-            await self._refresh_live_status_messages(int(poll["guild_id"]), "stage", int(poll["id"]))
+                    guild = self.bot.get_guild(poll["guild_id"])
+                    if not guild:
+                        continue
+                    channel = await self._resolve_text_channel(guild, poll["channel_id"])
+                    if not channel:
+                        continue
+                    await self._close_stage1_and_post(guild, poll, channel)
+                    await self._refresh_live_status_messages(int(poll["guild_id"]), "stage", int(poll["id"]))
+                except Exception as exc:
+                    print(f"[poll] failed to auto-close stage-1 poll {poll.get('id')}: {exc!r}")
 
-        for guild_id, kind, poll_id in await db.list_live_poll_status_targets():
-            await self._refresh_live_status_messages(guild_id, kind, poll_id)
+            for poll in await db.get_pending_preference_polls():
+                try:
+                    guild = self.bot.get_guild(poll["guild_id"])
+                    if not guild:
+                        continue
+                    channel = await self._resolve_text_channel(guild, poll["channel_id"])
+                    if not channel:
+                        continue
+                    await self._close_preference_and_post(guild, poll, channel)
+                    await self._refresh_live_status_messages(int(poll["guild_id"]), "stage", int(poll["id"]))
+                except Exception as exc:
+                    print(f"[poll] failed to auto-close preference poll {poll.get('id')}: {exc!r}")
+
+            for guild_id, kind, poll_id in await db.list_live_poll_status_targets():
+                try:
+                    await self._refresh_live_status_messages(guild_id, kind, poll_id)
+                except Exception as exc:
+                    print(f"[poll] failed to refresh live status {kind}/{poll_id}: {exc!r}")
+        except Exception as exc:
+            # Final backstop: keep the loop alive no matter what.
+            print(f"[poll] check_poll_closures sweep error: {exc!r}")
+
+    @check_poll_closures.before_loop
+    async def _before_check_poll_closures(self) -> None:
+        await self.bot.wait_until_ready()
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:

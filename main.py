@@ -30,6 +30,8 @@ def main() -> None:
     bot.load_extension("cogs.translate")
     # Discord ↔ Interspace account linking (/discord_link, /discord_unlink)
     bot.load_extension("cogs.link")
+    # Posts published card images to the card-releases channel.
+    bot.load_extension("cogs.card_releases")
     bot.run(BOT_TOKEN)
 
 
