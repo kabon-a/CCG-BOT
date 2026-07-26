@@ -24,3 +24,18 @@ K_FACTOR = 32  # Standard ELO sensitivity
 # INTERSPACE_BOT_SECRET: must match the BOT_SECRET env var on the Interspace backend.
 INTERSPACE_URL = os.getenv("INTERSPACE_URL", "").rstrip("/")
 INTERSPACE_BOT_SECRET = os.getenv("INTERSPACE_BOT_SECRET", "")
+
+# PSCT report → Cursor cloud agent → PR
+# CURSOR_API_KEY: user or service-account key from Cursor Dashboard → API Keys
+# REPORT_CHANNEL_ID: Discord channel snowflake for #report-a-problem (optional; name fallback used)
+CURSOR_API_KEY = os.getenv("CURSOR_API_KEY", "").strip()
+CURSOR_API_BASE = os.getenv("CURSOR_API_BASE", "https://api.cursor.com").rstrip("/")
+CURSOR_MODEL = os.getenv("CURSOR_MODEL", "composer-2.5").strip() or "composer-2.5"
+PSCT_REPO_URL = os.getenv(
+    "PSCT_REPO_URL",
+    "https://github.com/kabon-a/ccg-interspace",
+).strip().rstrip("/")
+PSCT_REPO_REF = os.getenv("PSCT_REPO_REF", "main").strip() or "main"
+_report_channel_raw = os.getenv("REPORT_CHANNEL_ID", "").strip()
+REPORT_CHANNEL_ID = int(_report_channel_raw) if _report_channel_raw.isdigit() else None
+REPORT_CHANNEL_NAME = os.getenv("REPORT_CHANNEL_NAME", "report-a-problem").strip() or "report-a-problem"

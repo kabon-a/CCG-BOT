@@ -535,6 +535,38 @@ async def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_active_users_match ON active_users(last_match_at)"
         )
 
+        # PSCT lint reports from #report-a-problem → Cursor cloud agent
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS psct_reports (
+                id TEXT PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                message_id INTEGER,
+                reporter_id INTEGER NOT NULL,
+                reporter_tag TEXT,
+                card_text TEXT NOT NULL,
+                problem TEXT NOT NULL,
+                expected TEXT NOT NULL,
+                card_type TEXT NOT NULL,
+                extra TEXT,
+                status TEXT NOT NULL,
+                reject_reason TEXT,
+                approver_id INTEGER,
+                cursor_agent_id TEXT,
+                cursor_run_id TEXT,
+                cursor_agent_url TEXT,
+                pr_url TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_psct_reports_status ON psct_reports(status)"
+        )
+
         await db.commit()
 
 
@@ -1797,3 +1829,98 @@ async def get_guild_first_languages(guild_id: int) -> dict[int, str]:
             (guild_id,),
         )
         return {int(r[0]): str(r[1]).lower().strip() for r in await cur.fetchall()}
+
+# --- PSCT reports (#report-a-problem -> Cursor cloud agent) ---
+
+_PSCT_STATUSES = frozenset({"pending", "rejected", "running", "pr_opened", "failed"})
+
+
+async def create_psct_report(
+    *,
+    report_id: str,
+    guild_id: int,
+    channel_id: int,
+    reporter_id: int,
+    reporter_tag: str,
+    card_text: str,
+    problem: str,
+    expected: str,
+    card_type: str,
+    extra: str | None = None,
+    message_id: int | None = None,
+) -> dict:
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        await conn.execute(
+            """
+            INSERT INTO psct_reports (
+                id, guild_id, channel_id, message_id, reporter_id, reporter_tag,
+                card_text, problem, expected, card_type, extra, status,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (
+                report_id,
+                guild_id,
+                channel_id,
+                message_id,
+                reporter_id,
+                reporter_tag,
+                card_text,
+                problem,
+                expected,
+                card_type,
+                extra,
+                now,
+                now,
+            ),
+        )
+        await conn.commit()
+    row = await get_psct_report(report_id)
+    assert row is not None
+    return row
+
+
+async def get_psct_report(report_id: str) -> dict | None:
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute("SELECT * FROM psct_reports WHERE id = ?", (report_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def update_psct_report(report_id: str, **fields: Any) -> dict | None:
+    from datetime import datetime, timezone
+
+    if not fields:
+        return await get_psct_report(report_id)
+    if "status" in fields and fields["status"] not in _PSCT_STATUSES:
+        raise ValueError(f"invalid psct report status: {fields['status']}")
+    fields = {**fields, "updated_at": datetime.now(timezone.utc).isoformat()}
+    cols = ", ".join(f"{k} = ?" for k in fields)
+    vals = list(fields.values()) + [report_id]
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        await conn.execute(f"UPDATE psct_reports SET {cols} WHERE id = ?", vals)
+        await conn.commit()
+    return await get_psct_report(report_id)
+
+
+async def list_psct_reports_needing_views() -> list[dict]:
+    """Reports whose Approve/Reject buttons should still be live after a bot restart."""
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            "SELECT * FROM psct_reports WHERE status IN ('pending', 'failed') ORDER BY created_at"
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def list_psct_reports_running() -> list[dict]:
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            "SELECT * FROM psct_reports WHERE status = 'running' ORDER BY created_at"
+        )
+        return [dict(r) for r in await cur.fetchall()]

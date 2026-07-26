@@ -32,6 +32,8 @@ def main() -> None:
     bot.load_extension("cogs.link")
     # Posts published card images to the card-releases channel.
     bot.load_extension("cogs.card_releases")
+    # PSCT lint reports from #report-a-problem → Cursor cloud agent → PR
+    bot.load_extension("cogs.psct_report")
     bot.run(BOT_TOKEN)
 
 
