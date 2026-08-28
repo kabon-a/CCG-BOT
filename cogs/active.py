@@ -7,9 +7,12 @@ A user qualifies for @active by satisfying **either** of these two criteria:
      last 10 days.
   2. Having a /record_match submission confirmed by an admin within the
      last 7 days.
+  3. An admin manually grants @active via ``/active grant`` for a set number
+     of days.
 
-The role is removed only when *both* windows have expired. A daily cleanup
-loop sweeps stale grants.
+The role is removed only when *all* windows have expired (including any
+admin manual grant from ``/active grant``). A daily cleanup loop sweeps
+stale grants.
 
 Outbound mirror: each grant also fires a best-effort ping at Interspace
 (``/api/discord/active-ping``) so linked web users count toward the
@@ -24,11 +27,13 @@ Interspace-side 65% poll quorum. The outbound ping never decides who gets
 # Enum)` then raises `TypeError: issubclass() arg 1 must be a class`, killing
 # /record_match with an ApplicationCommandInvokeError.
 
+import datetime
 import time
 from typing import Dict
 
 import aiohttp
 import discord
+from discord import Option
 from discord.ext import commands, tasks
 
 import database as db
@@ -43,6 +48,10 @@ REJECT_EMOJI = "❌"
 # Grant sources — kept as constants so callers don't pass magic strings.
 SOURCE_COURTROOM = "courtroom"
 SOURCE_MATCH = "match"
+SOURCE_MANUAL = "manual"
+
+MANUAL_GRANT_MIN_DAYS = 1
+MANUAL_GRANT_MAX_DAYS = 365
 
 
 def setup(bot: commands.Bot) -> None:
@@ -169,6 +178,41 @@ async def grant_active(
         pass
 
 
+async def grant_active_manual(
+    guild: discord.Guild,
+    user: discord.Member | discord.User,
+    *,
+    days: int,
+) -> float | None:
+    """Grant @active for ``days`` days via admin override. Returns expiry unix time."""
+    if not guild or not user or user.bot:
+        return None
+    member = guild.get_member(user.id) if isinstance(user, discord.User) else user
+    if not member:
+        return None
+
+    until = await db.record_manual_active(guild.id, user.id, days)
+
+    role = await ensure_active_role(guild)
+    if role and role not in member.roles:
+        try:
+            await member.add_roles(role, reason=f"Active ({SOURCE_MANUAL}, {days}d)")
+        except discord.Forbidden:
+            return None
+
+    try:
+        await _interspace_post("/api/discord/active-ping", {"discordId": str(user.id)})
+    except Exception:
+        pass
+
+    return until
+
+
+def _can_manage_active(member: discord.Member) -> bool:
+    perms = member.guild_permissions
+    return bool(perms.administrator or perms.manage_guild)
+
+
 async def _remove_stale_active_impl(bot: commands.Bot) -> None:
     """Strip @active from users with no activity in either window."""
     for guild in bot.guilds:
@@ -182,7 +226,7 @@ async def _remove_stale_active_impl(bot: commands.Bot) -> None:
                 try:
                     await member.remove_roles(
                         role,
-                        reason="No courtroom (10d) or confirmed-match (7d) activity",
+                        reason="No courtroom (10d), match (7d), or manual grant activity",
                     )
                 except discord.Forbidden:
                     pass
@@ -198,6 +242,12 @@ class ActiveCog(commands.Cog):
         self.bot = bot
         # message_id → { "guild_id": int, "user_id": int, "replay": str, "created_at": float }
         self._pending_match_approvals: Dict[int, dict] = {}
+
+    active_group = discord.SlashCommandGroup(
+        "active",
+        "Manage the @active role",
+        default_member_permissions=discord.Permissions(administrator=True),
+    )
 
     # ── Periodic tasks ──────────────────────────────────────────────────────
 
@@ -249,6 +299,51 @@ class ActiveCog(commands.Cog):
         user = self.bot.get_user(payload.user_id)
         if user:
             await grant_active(guild, user, source=SOURCE_COURTROOM)
+
+    @active_group.command(
+        name="grant",
+        description="Manually grant @active to a member for a number of days (Admin).",
+    )
+    async def active_grant(
+        self,
+        ctx: discord.ApplicationContext,
+        member: Option(discord.Member, "Member to grant @active", required=True),
+        days: Option(
+            int,
+            f"Number of days ({MANUAL_GRANT_MIN_DAYS}–{MANUAL_GRANT_MAX_DAYS})",
+            required=True,
+            min_value=MANUAL_GRANT_MIN_DAYS,
+            max_value=MANUAL_GRANT_MAX_DAYS,
+        ),
+    ) -> None:
+        if not ctx.guild or not ctx.author:
+            await ctx.respond("This command must be used in a server.", ephemeral=True)
+            return
+        if not isinstance(ctx.author, discord.Member) or not _can_manage_active(ctx.author):
+            await ctx.respond(
+                "You need Administrator or Manage Server permission.",
+                ephemeral=True,
+            )
+            return
+        if member.bot:
+            await ctx.respond("Bots cannot receive @active.", ephemeral=True)
+            return
+
+        until = await grant_active_manual(ctx.guild, member, days=days)
+        if until is None:
+            await ctx.respond(
+                "Could not grant @active. Check that the bot has **Manage Roles** "
+                "and its role is above @active.",
+                ephemeral=True,
+            )
+            return
+
+        expiry = datetime.datetime.fromtimestamp(until, tz=datetime.timezone.utc)
+        await ctx.respond(
+            f"Granted {member.mention} @active for **{days}** day(s) "
+            f"(until {discord.utils.format_dt(expiry, 'F')}).",
+            ephemeral=True,
+        )
 
     # ── /record_match command ───────────────────────────────────────────────
 

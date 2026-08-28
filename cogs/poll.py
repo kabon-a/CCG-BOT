@@ -110,6 +110,39 @@ def _coerce_epoch_seconds(value) -> float | None:
     return None
 
 
+# Cap how many times we retry a failed auto-close before marking the poll
+# permanently failed. Backoff grows exponentially: 60s, 120s, 240s… capped at 1h.
+_CLOSE_MAX_ATTEMPTS = 20
+_CLOSE_BACKOFF_BASE_SEC = 60
+_CLOSE_BACKOFF_MAX_SEC = 3600
+
+
+def _close_backoff_seconds(attempts: int) -> float:
+    exp = max(0, int(attempts) - 1)
+    return float(min(_CLOSE_BACKOFF_MAX_SEC, _CLOSE_BACKOFF_BASE_SEC * (2 ** exp)))
+
+
+def _stage2_option_indices(result: dict) -> list[int]:
+    """Prefer Interspace's ``stage2Options`` objects; fall back to legacy indices."""
+    opts = result.get("stage2Options")
+    if isinstance(opts, list) and opts:
+        out: list[int] = []
+        for item in opts:
+            if isinstance(item, dict) and "index" in item:
+                try:
+                    out.append(int(item["index"]))
+                except (TypeError, ValueError):
+                    continue
+            elif isinstance(item, int):
+                out.append(item)
+        if out:
+            return out
+    legacy = result.get("stage2OptionIndices", [])
+    if isinstance(legacy, list):
+        return [int(x) for x in legacy if isinstance(x, (int, float, str)) and str(x).isdigit()]
+    return []
+
+
 def _interspace_headers() -> dict:
     return {"x-bot-secret": INTERSPACE_BOT_SECRET, "Content-Type": "application/json"}
 
@@ -614,7 +647,7 @@ class PollCog(commands.Cog):
         if not poll or poll["guild_id"] != ctx.guild.id:
             await ctx.respond("Stage poll not found.", ephemeral=True)
             return
-        if poll["status"] != "stage1_open":
+        if poll["status"] not in ("stage1_open", "failed_stage1"):
             await ctx.respond("Stage 1 is already closed for this poll.", ephemeral=True)
             return
 
@@ -630,30 +663,98 @@ class PollCog(commands.Cog):
         await self._refresh_live_status_messages(ctx.guild.id, "stage", poll_id)
         await ctx.respond("Stage 1 closed and report posted.", ephemeral=True)
 
+    async def _schedule_close_retry(
+        self,
+        poll: dict,
+        *,
+        channel: discord.abc.Messageable | None,
+        error: str,
+        fail_status: str,
+        title_prefix: str,
+    ) -> None:
+        """Retry later on transient failures; only permanently fail after max attempts."""
+        poll_id = int(poll["id"])
+        attempts = int(poll.get("attempts") or 0) + 1
+        if attempts >= _CLOSE_MAX_ATTEMPTS:
+            await db.set_stage_poll_status(
+                poll_id,
+                fail_status,
+                preference_options=json.loads(poll["preference_options"])
+                if poll.get("preference_options")
+                else None,
+                preference_ends_at=poll.get("preference_ends_at"),
+                attempts=attempts,
+                next_retry_at=None,
+                last_close_error=error,
+            )
+            if channel is not None:
+                embed = discord.Embed(
+                    title=f"{title_prefix} (ID {poll_id})",
+                    description=(
+                        f"❌ Auto-close failed after {attempts} attempts.\n"
+                        f"`{error[:300]}`\n"
+                        "An admin can retry with `/poll stage_close` once Interspace is reachable."
+                    ),
+                    color=0x8B0000,
+                    timestamp=discord.utils.utcnow(),
+                )
+                try:
+                    await channel.send(embed=embed)
+                except discord.HTTPException:
+                    pass
+            print(f"[poll] permanently failed poll {poll_id}: {error}")
+            return
+
+        backoff = _close_backoff_seconds(attempts)
+        # Re-open so pending queries keep picking this poll up after backoff.
+        keep_status = "preference_open" if fail_status == "failed_preference" else "stage1_open"
+        await db.set_stage_poll_status(
+            poll_id,
+            keep_status,
+            preference_options=json.loads(poll["preference_options"])
+            if poll.get("preference_options") and keep_status == "preference_open"
+            else (json.loads(poll["preference_options"]) if poll.get("preference_options") else None),
+            preference_ends_at=poll.get("preference_ends_at"),
+            attempts=attempts,
+            next_retry_at=time.time() + backoff,
+            last_close_error=error,
+        )
+        print(
+            f"[poll] close retry scheduled for {poll_id} "
+            f"(attempt {attempts}/{_CLOSE_MAX_ATTEMPTS}, backoff {int(backoff)}s): {error}"
+        )
+
     async def _close_stage1_and_post(
         self,
         guild: discord.Guild,
         poll: dict,
-        channel: discord.abc.Messageable,
-    ) -> None:
+        channel: discord.abc.Messageable | None,
+    ) -> bool:
+        """Close Stage 1 via Interspace. Returns True on success."""
         poll_id = int(poll["id"])
-        options: list[str] = json.loads(poll["options"])
 
-        # Ask Interspace to compute the Stage 1 result from locked Interspace votes
+        # If a previous run left us in failed_stage1, flip back to open for compute.
+        if poll.get("status") == "failed_stage1":
+            await db.set_stage_poll_status(
+                poll_id,
+                "stage1_open",
+                attempts=int(poll.get("attempts") or 0),
+                next_retry_at=poll.get("next_retry_at"),
+                last_close_error=poll.get("last_close_error"),
+            )
+
         interspace_id = f"stage-{poll_id}"
         result = await _interspace_post_compute(f"/api/polls/{interspace_id}/compute")
 
         if result is None:
-            # Interspace unreachable — mark poll failed locally and post an error
-            await db.set_stage_poll_status(poll_id, "failed_stage1")
-            embed = discord.Embed(
-                title=f"📊 Stage 1 Results: {poll['title']} (ID {poll_id})",
-                description="❌ Could not reach Interspace to compute results. Poll marked as failed.",
-                color=0x8B0000,
-                timestamp=discord.utils.utcnow(),
+            await self._schedule_close_retry(
+                poll,
+                channel=channel,
+                error="Could not reach Interspace to compute Stage 1 results",
+                fail_status="failed_stage1",
+                title_prefix=f"📊 Stage 1 Results: {poll['title']}",
             )
-            await channel.send(embed=embed)
-            return
+            return False
 
         # Build Discord embed from Interspace result
         report_lines_raw = result.get("reportLines", [])
@@ -693,7 +794,11 @@ class PollCog(commands.Cog):
                 value=f"🌐 Cast your Stage 2 preference at: {INTERSPACE_URL}",
                 inline=False,
             )
-        await channel.send(embed=embed)
+        if channel is not None:
+            try:
+                await channel.send(embed=embed)
+            except discord.HTTPException as exc:
+                print(f"[poll] could not post Stage 1 results for {poll_id}: {exc!r}")
 
         if needs_stage2:
             # Normalize Interspace's close time to epoch seconds (it may send an
@@ -707,36 +812,66 @@ class PollCog(commands.Cog):
             await db.set_stage_poll_status(
                 poll_id,
                 "preference_open",
-                preference_options=result.get("stage2OptionIndices", []),
+                preference_options=_stage2_option_indices(result),
                 preference_ends_at=pref_ends_at,
+                attempts=0,
+                next_retry_at=None,
+                last_close_error=None,
             )
         else:
-            await db.set_stage_poll_status(poll_id, new_status)
+            await db.set_stage_poll_status(
+                poll_id,
+                new_status,
+                attempts=0,
+                next_retry_at=None,
+                last_close_error=None,
+            )
+        return True
 
     async def _close_preference_and_post(
         self,
         guild: discord.Guild,
         stage_poll: dict,
-        channel: discord.abc.Messageable,
-    ) -> None:
+        channel: discord.abc.Messageable | None,
+    ) -> bool:
+        """Close Stage 2 via Interspace. Returns True on success."""
         stage_id = int(stage_poll["id"])
+
+        if stage_poll.get("status") == "failed_preference":
+            await db.set_stage_poll_status(
+                stage_id,
+                "preference_open",
+                preference_options=json.loads(stage_poll["preference_options"])
+                if stage_poll.get("preference_options")
+                else None,
+                preference_ends_at=stage_poll.get("preference_ends_at"),
+                attempts=int(stage_poll.get("attempts") or 0),
+                next_retry_at=stage_poll.get("next_retry_at"),
+                last_close_error=stage_poll.get("last_close_error"),
+            )
+
         interspace_id = f"stage-{stage_id}"
         result = await _interspace_post_compute(f"/api/polls/{interspace_id}/compute-preference")
 
         if result is None:
-            await db.set_stage_poll_status(stage_id, "failed_preference")
-            embed = discord.Embed(
-                title=f"📊 Stage 2 Results: {stage_poll['title']} (ID {stage_id})",
-                description="❌ Could not reach Interspace to compute Stage 2 results.",
-                color=0x8B0000,
-                timestamp=discord.utils.utcnow(),
+            await self._schedule_close_retry(
+                stage_poll,
+                channel=channel,
+                error="Could not reach Interspace to compute Stage 2 results",
+                fail_status="failed_preference",
+                title_prefix=f"📊 Stage 2 Results: {stage_poll['title']}",
             )
-            await channel.send(embed=embed)
-            return
+            return False
 
         outcome = result.get("outcome", "")
         new_status = result.get("status", "failed_preference")
-        await db.set_stage_poll_status(stage_id, new_status)
+        await db.set_stage_poll_status(
+            stage_id,
+            new_status,
+            attempts=0,
+            next_retry_at=None,
+            last_close_error=None,
+        )
 
         counts_data = result.get("counts", [])
         lines = [f"**{item['option']}** — {item['count']} vote(s)" for item in counts_data]
@@ -747,7 +882,12 @@ class PollCog(commands.Cog):
             color=0x2E86AB if "passed" in new_status else 0x8B0000,
             timestamp=discord.utils.utcnow(),
         )
-        await channel.send(embed=embed)
+        if channel is not None:
+            try:
+                await channel.send(embed=embed)
+            except discord.HTTPException as exc:
+                print(f"[poll] could not post Stage 2 results for {stage_id}: {exc!r}")
+        return True
 
     @poll_group.command(name="status", description="View current results/status for a poll ID.")
     async def poll_status(
@@ -1007,27 +1147,75 @@ class PollCog(commands.Cog):
                 try:
                     guild = self.bot.get_guild(poll["guild_id"])
                     if not guild:
+                        await self._schedule_close_retry(
+                            poll,
+                            channel=None,
+                            error=f"Guild {poll['guild_id']} not in bot cache",
+                            fail_status="failed_stage1",
+                            title_prefix=f"📊 Stage 1 Results: {poll['title']}",
+                        )
                         continue
                     channel = await self._resolve_text_channel(guild, poll["channel_id"])
                     if not channel:
+                        await self._schedule_close_retry(
+                            poll,
+                            channel=None,
+                            error=f"Channel {poll['channel_id']} unresolved",
+                            fail_status="failed_stage1",
+                            title_prefix=f"📊 Stage 1 Results: {poll['title']}",
+                        )
                         continue
                     await self._close_stage1_and_post(guild, poll, channel)
                     await self._refresh_live_status_messages(int(poll["guild_id"]), "stage", int(poll["id"]))
                 except Exception as exc:
                     print(f"[poll] failed to auto-close stage-1 poll {poll.get('id')}: {exc!r}")
+                    try:
+                        await self._schedule_close_retry(
+                            poll,
+                            channel=None,
+                            error=repr(exc),
+                            fail_status="failed_stage1",
+                            title_prefix=f"📊 Stage 1 Results: {poll.get('title', '')}",
+                        )
+                    except Exception as nested:
+                        print(f"[poll] could not schedule retry for {poll.get('id')}: {nested!r}")
 
             for poll in await db.get_pending_preference_polls():
                 try:
                     guild = self.bot.get_guild(poll["guild_id"])
                     if not guild:
+                        await self._schedule_close_retry(
+                            poll,
+                            channel=None,
+                            error=f"Guild {poll['guild_id']} not in bot cache",
+                            fail_status="failed_preference",
+                            title_prefix=f"📊 Stage 2 Results: {poll['title']}",
+                        )
                         continue
                     channel = await self._resolve_text_channel(guild, poll["channel_id"])
                     if not channel:
+                        await self._schedule_close_retry(
+                            poll,
+                            channel=None,
+                            error=f"Channel {poll['channel_id']} unresolved",
+                            fail_status="failed_preference",
+                            title_prefix=f"📊 Stage 2 Results: {poll['title']}",
+                        )
                         continue
                     await self._close_preference_and_post(guild, poll, channel)
                     await self._refresh_live_status_messages(int(poll["guild_id"]), "stage", int(poll["id"]))
                 except Exception as exc:
                     print(f"[poll] failed to auto-close preference poll {poll.get('id')}: {exc!r}")
+                    try:
+                        await self._schedule_close_retry(
+                            poll,
+                            channel=None,
+                            error=repr(exc),
+                            fail_status="failed_preference",
+                            title_prefix=f"📊 Stage 2 Results: {poll.get('title', '')}",
+                        )
+                    except Exception as nested:
+                        print(f"[poll] could not schedule retry for {poll.get('id')}: {nested!r}")
 
             for guild_id, kind, poll_id in await db.list_live_poll_status_targets():
                 try:

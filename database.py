@@ -358,6 +358,7 @@ async def init_db() -> None:
                 last_activity REAL NOT NULL,
                 last_courtroom_at REAL,
                 last_match_at REAL,
+                manual_active_until REAL,
                 PRIMARY KEY (guild_id, user_id)
             )
         """)
@@ -487,6 +488,18 @@ async def init_db() -> None:
         except aiosqlite.OperationalError:
             pass
 
+        # Auto-close retry bookkeeping — used when Interspace is down or the
+        # Discord channel can't be resolved so we don't permanently abandon
+        # a poll that merely hit a transient failure.
+        try:
+            await db.execute("ALTER TABLE stage_polls ADD COLUMN next_retry_at REAL")
+        except aiosqlite.OperationalError:
+            pass
+        try:
+            await db.execute("ALTER TABLE stage_polls ADD COLUMN last_close_error TEXT")
+        except aiosqlite.OperationalError:
+            pass
+
         try:
             await db.execute("ALTER TABLE member_entries ADD COLUMN match_count INTEGER NOT NULL DEFAULT 0")
         except aiosqlite.OperationalError:
@@ -522,6 +535,10 @@ async def init_db() -> None:
             pass
         try:
             await db.execute("ALTER TABLE active_users ADD COLUMN last_match_at REAL")
+        except aiosqlite.OperationalError:
+            pass
+        try:
+            await db.execute("ALTER TABLE active_users ADD COLUMN manual_active_until REAL")
         except aiosqlite.OperationalError:
             pass
 
@@ -1377,13 +1394,12 @@ async def list_live_poll_status_targets() -> list[tuple[int, str, int]]:
 
 # --- Active users (for @active role) ---
 #
-# Two independent grant criteria:
-#   * courtroom interaction (messages/reactions in the ❗❗-the-courtroom forum
-#     or any of its threads) within the last 10 days
-#   * /record_match submission confirmed by an admin within the last 7 days
+# Grant criteria (any one keeps @active):
+#   * courtroom interaction within the last 10 days
+#   * admin-confirmed /record_match within the last 7 days
+#   * admin manual grant via /active grant (``manual_active_until``)
 #
-# A user holds @active iff at least one of those timestamps is inside its
-# window. The role is removed only when BOTH windows have expired.
+# The role is removed only when all applicable windows have expired.
 
 COURTROOM_WINDOW_SECONDS = 10 * 24 * 60 * 60  # 10 days
 MATCH_WINDOW_SECONDS = 7 * 24 * 60 * 60  # 7 days
@@ -1423,11 +1439,30 @@ async def record_match_activity(guild_id: int, user_id: int) -> None:
         await conn.commit()
 
 
+async def record_manual_active(guild_id: int, user_id: int, days: int) -> float:
+    """Grant @active via admin override for ``days`` days from now."""
+    now = time.time()
+    until = now + days * 86400
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        await conn.execute(
+            """
+            INSERT INTO active_users (guild_id, user_id, last_activity, manual_active_until)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                last_activity = excluded.last_activity,
+                manual_active_until = excluded.manual_active_until
+            """,
+            (guild_id, user_id, now, until),
+        )
+        await conn.commit()
+    return until
+
+
 async def get_active_user_ids(guild_id: int) -> set[int]:
     """Return user IDs currently eligible for @active.
 
     Eligible = courtroom interaction within ``COURTROOM_WINDOW_SECONDS`` OR
-    confirmed match within ``MATCH_WINDOW_SECONDS``.
+    confirmed match within ``MATCH_WINDOW_SECONDS`` OR manual grant not expired.
     """
     now = time.time()
     cr_cutoff = now - COURTROOM_WINDOW_SECONDS
@@ -1440,15 +1475,16 @@ async def get_active_user_ids(guild_id: int) -> set[int]:
               AND (
                 (last_courtroom_at IS NOT NULL AND last_courtroom_at >= ?)
                 OR (last_match_at IS NOT NULL AND last_match_at >= ?)
+                OR (manual_active_until IS NOT NULL AND manual_active_until >= ?)
               )
             """,
-            (guild_id, cr_cutoff, mt_cutoff),
+            (guild_id, cr_cutoff, mt_cutoff, now),
         )
         return {r[0] for r in await cur.fetchall()}
 
 
 async def get_user_ids_to_remove_active(guild_id: int) -> list[int]:
-    """Return user IDs whose courtroom AND match windows have both expired."""
+    """Return user IDs with no remaining courtroom, match, or manual grant."""
     now = time.time()
     cr_cutoff = now - COURTROOM_WINDOW_SECONDS
     mt_cutoff = now - MATCH_WINDOW_SECONDS
@@ -1459,8 +1495,9 @@ async def get_user_ids_to_remove_active(guild_id: int) -> list[int]:
             WHERE guild_id = ?
               AND (last_courtroom_at IS NULL OR last_courtroom_at < ?)
               AND (last_match_at IS NULL OR last_match_at < ?)
+              AND (manual_active_until IS NULL OR manual_active_until < ?)
             """,
-            (guild_id, cr_cutoff, mt_cutoff),
+            (guild_id, cr_cutoff, mt_cutoff, now),
         )
         return [r[0] for r in await cur.fetchall()]
 
@@ -1650,19 +1687,66 @@ async def set_stage_poll_status(
     preference_options: list[int] | None = None,
     preference_ends_at: float | None = None,
     attempts: int | None = None,
+    next_retry_at: float | None = ...,  # type: ignore[assignment]
+    last_close_error: str | None = ...,  # type: ignore[assignment]
 ) -> None:
+    """Update stage poll status.
+
+    Pass ``next_retry_at`` / ``last_close_error`` explicitly to set them.
+    Omit them (ellipsis default) to leave existing values untouched.
+    Pass ``None`` to clear them.
+    """
     async with aiosqlite.connect(DATABASE_PATH) as conn:
         pref_json = None if preference_options is None else json.dumps(preference_options)
-        if attempts is None:
-            await conn.execute(
-                "UPDATE stage_polls SET status = ?, preference_options = ?, preference_ends_at = ? WHERE id = ?",
-                (status, pref_json, preference_ends_at, poll_id),
-            )
-        else:
-            await conn.execute(
-                "UPDATE stage_polls SET status = ?, preference_options = ?, preference_ends_at = ?, attempts = ? WHERE id = ?",
-                (status, pref_json, preference_ends_at, attempts, poll_id),
-            )
+        sets = ["status = ?", "preference_options = ?", "preference_ends_at = ?"]
+        vals: list = [status, pref_json, preference_ends_at]
+        if attempts is not None:
+            sets.append("attempts = ?")
+            vals.append(attempts)
+        if next_retry_at is not ...:
+            sets.append("next_retry_at = ?")
+            vals.append(next_retry_at)
+        if last_close_error is not ...:
+            sets.append("last_close_error = ?")
+            vals.append(last_close_error)
+        vals.append(poll_id)
+        await conn.execute(
+            f"UPDATE stage_polls SET {', '.join(sets)} WHERE id = ?",
+            vals,
+        )
+        await conn.commit()
+
+
+async def schedule_stage_poll_retry(
+    poll_id: int,
+    *,
+    attempts: int,
+    error: str,
+    backoff_seconds: float,
+) -> None:
+    """Keep the poll open for another close attempt after ``backoff_seconds``."""
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        await conn.execute(
+            """
+            UPDATE stage_polls
+            SET attempts = ?, next_retry_at = ?, last_close_error = ?
+            WHERE id = ?
+            """,
+            (attempts, time.time() + backoff_seconds, (error or "")[:500], poll_id),
+        )
+        await conn.commit()
+
+
+async def clear_stage_poll_retry(poll_id: int) -> None:
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        await conn.execute(
+            """
+            UPDATE stage_polls
+            SET next_retry_at = NULL, last_close_error = NULL, attempts = 0
+            WHERE id = ?
+            """,
+            (poll_id,),
+        )
         await conn.commit()
 
 
@@ -1697,12 +1781,18 @@ async def clear_stage_preference_votes(poll_id: int) -> None:
 
 
 async def get_pending_stage1_polls() -> list[dict]:
+    """Stage-1 polls whose duration elapsed and are due for (re)close."""
     now = time.time()
     async with aiosqlite.connect(DATABASE_PATH) as conn:
         conn.row_factory = aiosqlite.Row
         cur = await conn.execute(
-            "SELECT * FROM stage_polls WHERE status = 'stage1_open' AND ends_at <= ?",
-            (now,),
+            """
+            SELECT * FROM stage_polls
+            WHERE status IN ('stage1_open', 'failed_stage1')
+              AND ends_at <= ?
+              AND (next_retry_at IS NULL OR next_retry_at <= ?)
+            """,
+            (now, now),
         )
         return [dict(r) for r in await cur.fetchall()]
 
@@ -1714,9 +1804,12 @@ async def get_pending_preference_polls() -> list[dict]:
         cur = await conn.execute(
             """
             SELECT * FROM stage_polls
-            WHERE status = 'preference_open' AND preference_ends_at IS NOT NULL AND preference_ends_at <= ?
+            WHERE status IN ('preference_open', 'failed_preference')
+              AND preference_ends_at IS NOT NULL
+              AND preference_ends_at <= ?
+              AND (next_retry_at IS NULL OR next_retry_at <= ?)
             """,
-            (now,),
+            (now, now),
         )
         return [dict(r) for r in await cur.fetchall()]
 
