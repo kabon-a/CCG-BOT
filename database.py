@@ -1788,7 +1788,7 @@ async def get_pending_stage1_polls() -> list[dict]:
         cur = await conn.execute(
             """
             SELECT * FROM stage_polls
-            WHERE status IN ('stage1_open', 'failed_stage1')
+            WHERE status = 'stage1_open'
               AND ends_at <= ?
               AND (next_retry_at IS NULL OR next_retry_at <= ?)
             """,
@@ -1804,7 +1804,7 @@ async def get_pending_preference_polls() -> list[dict]:
         cur = await conn.execute(
             """
             SELECT * FROM stage_polls
-            WHERE status IN ('preference_open', 'failed_preference')
+            WHERE status = 'preference_open'
               AND preference_ends_at IS NOT NULL
               AND preference_ends_at <= ?
               AND (next_retry_at IS NULL OR next_retry_at <= ?)

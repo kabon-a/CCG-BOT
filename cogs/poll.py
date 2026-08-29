@@ -659,6 +659,11 @@ class PollCog(commands.Cog):
         # followup endpoint and remains valid for up to 15 minutes.
         await ctx.defer(ephemeral=True)
 
+        await db.clear_stage_poll_retry(poll_id)
+        if poll["status"] == "failed_stage1":
+            await db.set_stage_poll_status(poll_id, "stage1_open")
+            poll = await db.get_stage_poll_by_id(poll_id) or poll
+
         await self._close_stage1_and_post(ctx.guild, poll, ctx.channel)
         await self._refresh_live_status_messages(ctx.guild.id, "stage", poll_id)
         await ctx.respond("Stage 1 closed and report posted.", ephemeral=True)
@@ -675,6 +680,7 @@ class PollCog(commands.Cog):
         """Retry later on transient failures; only permanently fail after max attempts."""
         poll_id = int(poll["id"])
         attempts = int(poll.get("attempts") or 0) + 1
+        already_failed = poll.get("status") == fail_status
         if attempts >= _CLOSE_MAX_ATTEMPTS:
             await db.set_stage_poll_status(
                 poll_id,
@@ -687,7 +693,7 @@ class PollCog(commands.Cog):
                 next_retry_at=None,
                 last_close_error=error,
             )
-            if channel is not None:
+            if channel is not None and not already_failed:
                 embed = discord.Embed(
                     title=f"{title_prefix} (ID {poll_id})",
                     description=(
@@ -732,16 +738,6 @@ class PollCog(commands.Cog):
     ) -> bool:
         """Close Stage 1 via Interspace. Returns True on success."""
         poll_id = int(poll["id"])
-
-        # If a previous run left us in failed_stage1, flip back to open for compute.
-        if poll.get("status") == "failed_stage1":
-            await db.set_stage_poll_status(
-                poll_id,
-                "stage1_open",
-                attempts=int(poll.get("attempts") or 0),
-                next_retry_at=poll.get("next_retry_at"),
-                last_close_error=poll.get("last_close_error"),
-            )
 
         interspace_id = f"stage-{poll_id}"
         result = await _interspace_post_compute(f"/api/polls/{interspace_id}/compute")
@@ -836,19 +832,6 @@ class PollCog(commands.Cog):
     ) -> bool:
         """Close Stage 2 via Interspace. Returns True on success."""
         stage_id = int(stage_poll["id"])
-
-        if stage_poll.get("status") == "failed_preference":
-            await db.set_stage_poll_status(
-                stage_id,
-                "preference_open",
-                preference_options=json.loads(stage_poll["preference_options"])
-                if stage_poll.get("preference_options")
-                else None,
-                preference_ends_at=stage_poll.get("preference_ends_at"),
-                attempts=int(stage_poll.get("attempts") or 0),
-                next_retry_at=stage_poll.get("next_retry_at"),
-                last_close_error=stage_poll.get("last_close_error"),
-            )
 
         interspace_id = f"stage-{stage_id}"
         result = await _interspace_post_compute(f"/api/polls/{interspace_id}/compute-preference")
