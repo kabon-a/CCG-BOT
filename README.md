@@ -84,6 +84,7 @@ A Discord bot for Yu-Gi-Oh! format management: ELO ranking, archetype tier lists
 | `/poll stage_create <title> <options> <duration> <preference_duration> <num_tiers> [roles]` | Create a two-stage tier poll (Stage 1 tier assignment + Stage 2 preference if needed), with Stage 2 auto-close duration set up-front. |
 | `/poll stage_vote <poll_id> <option_index> <tier>` | Submit/update your Stage 1 tier input for an option. |
 | `/poll stage_close <poll_id>` | Close Stage 1, compute Simpson thresholds + EV fallback, and apply outcome rules. |
+| `/poll status <poll> [live]` | Full status card for a poll. Accepts either the poll ID (`49`) or the proposal ID (`PROP-A4F2`). Shows options with their live tier histograms and expected tier, the Simpson cutoff per option, participation against the 65% quorum, abstains, and the final outcome once closed. `live` posts a channel message the bot keeps re-editing. |
 | `Stage 2 preference` | Opened automatically from Stage 1 when required. Voting is by **reaction** in the Stage 2 message; closes automatically using `preference_duration`. |
 
 Polls use reaction-based voting (users may vote on multiple options). When a poll closes, the bot posts a report with:

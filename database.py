@@ -408,7 +408,8 @@ async def init_db() -> None:
                 preference_options TEXT,
                 preference_duration_seconds INTEGER NOT NULL DEFAULT 0,
                 preference_ends_at REAL,
-                attempts INTEGER NOT NULL DEFAULT 0
+                attempts INTEGER NOT NULL DEFAULT 0,
+                proposal_id TEXT
             )
         """)
         await db.execute("""
@@ -497,6 +498,12 @@ async def init_db() -> None:
             pass
         try:
             await db.execute("ALTER TABLE stage_polls ADD COLUMN last_close_error TEXT")
+        except aiosqlite.OperationalError:
+            pass
+        # Interspace proposal this stage poll was opened for (e.g. PROP-A4F2),
+        # so /poll status can be looked up by proposal id without a round-trip.
+        try:
+            await db.execute("ALTER TABLE stage_polls ADD COLUMN proposal_id TEXT")
         except aiosqlite.OperationalError:
             pass
 
@@ -1621,6 +1628,7 @@ async def create_stage_poll(
     num_tiers: int,
     duration_seconds: int,
     preference_duration_seconds: int,
+    proposal_id: str | None = None,
 ) -> int:
     now = time.time()
     ends_at = now + duration_seconds
@@ -1628,9 +1636,10 @@ async def create_stage_poll(
         cur = await conn.execute(
             """
             INSERT INTO stage_polls (
-                guild_id, channel_id, title, options, role_ids, num_tiers, ends_at, created_at, preference_duration_seconds
+                guild_id, channel_id, title, options, role_ids, num_tiers, ends_at, created_at,
+                preference_duration_seconds, proposal_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 guild_id,
@@ -1642,6 +1651,7 @@ async def create_stage_poll(
                 ends_at,
                 now,
                 preference_duration_seconds,
+                proposal_id,
             ),
         )
         await conn.commit()
@@ -1652,6 +1662,24 @@ async def get_stage_poll_by_id(poll_id: int) -> dict | None:
     async with aiosqlite.connect(DATABASE_PATH) as conn:
         conn.row_factory = aiosqlite.Row
         cur = await conn.execute("SELECT * FROM stage_polls WHERE id = ?", (poll_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def get_stage_poll_by_proposal_id(guild_id: int, proposal_id: str) -> dict | None:
+    """Find the newest stage poll opened for an Interspace proposal id."""
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            """
+            SELECT * FROM stage_polls
+            WHERE guild_id = ? AND proposal_id IS NOT NULL
+              AND LOWER(proposal_id) = LOWER(?)
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (guild_id, proposal_id),
+        )
         row = await cur.fetchone()
         return dict(row) if row else None
 
@@ -1840,10 +1868,14 @@ async def sync_stage_poll_from_interspace(
     options: list[str] | None = None,
     num_tiers: int | None = None,
     preference_options: list[int] | None = ...,  # type: ignore[assignment]
+    proposal_id: str | None = None,
 ) -> None:
     """Mirror Interspace schedule / metadata onto the local stage poll row."""
     sets: list[str] = []
     vals: list = []
+    if proposal_id is not None and str(proposal_id).strip():
+        sets.append("proposal_id = ?")
+        vals.append(str(proposal_id).strip())
     if ends_at is not None:
         sets.append("ends_at = ?")
         vals.append(float(ends_at))

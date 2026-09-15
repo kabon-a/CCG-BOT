@@ -122,6 +122,48 @@ def _close_backoff_seconds(attempts: int) -> float:
     return float(min(_CLOSE_BACKOFF_MAX_SEC, _CLOSE_BACKOFF_BASE_SEC * (2 ** exp)))
 
 
+_STATUS_LABELS = {
+    "stage1_open": "Stage 1 open — tier voting",
+    "preference_open": "Stage 2 open — preference voting",
+    "passed_auto": "Closed — passed (auto-selected)",
+    "passed_preference": "Closed — passed via Stage 2 preference",
+    "failed_quorum": "Closed — failed, quorum not met",
+    "failed_stage1": "Closed — Stage 1 inconclusive",
+    "failed_preference": "Closed — Stage 2 had no valid votes",
+    "failed_preference_quorum": "Closed — Stage 2 quorum not met",
+    "failed_preference_tie": "Closed — Stage 2 tie, inconclusive",
+    "annulled": "Annulled — failed three times",
+}
+
+_OPEN_STATUSES = ("stage1_open", "preference_open")
+
+
+def _status_label(status: str) -> str:
+    return _STATUS_LABELS.get(status, status or "unknown")
+
+
+def _tier_label_and_audience(tier, sub) -> tuple[str, str]:
+    """Human-readable proposal tier plus who may vote on it."""
+    try:
+        tier_num = int(tier) if tier is not None else 0
+    except (TypeError, ValueError):
+        tier_num = 0
+    if tier_num == 3 and sub:
+        return f"Tier 3 — Type {sub}", (
+            "Overseers only" if str(sub).upper() == "I" else "Overseers + Admins"
+        )
+    if tier_num == 2:
+        return "Tier 2", "Format Council"
+    if tier_num == 1:
+        return "Tier 1", "Everyone"
+    return "Untiered", "(see Interspace)"
+
+
+def _bar(fraction: float, width: int = 10) -> str:
+    filled = int(round(max(0.0, min(1.0, fraction)) * width))
+    return "█" * filled + "░" * (width - filled)
+
+
 def _stage2_option_indices(result: dict) -> list[int]:
     """Prefer Interspace's ``stage2Options`` objects; fall back to legacy indices."""
     opts = result.get("stage2Options")
@@ -355,37 +397,178 @@ class PollCog(commands.Cog):
             timestamp=discord.utils.utcnow(),
         )
 
-    async def _build_stage_status_embed(self, stage: dict) -> discord.Embed:
+    async def _build_stage_status_embed(
+        self, stage: dict, remote: dict | None = None,
+    ) -> discord.Embed:
+        """Full status card: options, live tiers, Simpson cutoffs, quorum, outcome.
+
+        Live vote data lives on Interspace, so we render whatever
+        ``/bot-status`` reports. Without it we can only show the local
+        schedule/status, which the embed says explicitly rather than
+        implying nobody has voted.
+        """
         now = discord.utils.utcnow().timestamp()
         poll_id = int(stage["id"])
-        options = json.loads(stage["options"])
-        num_tiers = int(stage["num_tiers"])
-        status = str(stage["status"])
-        votes = await db.get_stage_votes(poll_id)
+        if remote is None:
+            remote = await _interspace_get(f"/api/polls/stage-{poll_id}/bot-status")
+        remote = remote or {}
 
-        by_option = [[0] * num_tiers for _ in options]
-        unique_voters: set = set()
-        for uid, oi, tier in votes:
-            unique_voters.add(uid)
-            if 0 <= oi < len(options) and 1 <= tier <= num_tiers:
-                by_option[oi][tier - 1] += 1
+        options = remote.get("options")
+        if not isinstance(options, list) or not options:
+            options = json.loads(stage["options"])
+        num_tiers = int(remote.get("numTiers") or stage["num_tiers"])
+        status = str(remote.get("status") or stage["status"])
+        title = remote.get("title") or stage["title"]
+        proposal_ref = remote.get("proposalShortId") or stage.get("proposal_id")
 
-        lines = [f"**Status:** `{status}`", f"**Stage 1 unique voters (Interspace):** {len(unique_voters)}"]
-        stage1_left = max(0, int(float(stage["ends_at"]) - now))
+        tier_label, audience = _tier_label_and_audience(
+            remote.get("proposalTier"), remote.get("proposalTier3SubType")
+        )
+
+        header = [f"**Poll ID** `{poll_id}`"]
+        if proposal_ref:
+            header.append(f"**Proposal** `{proposal_ref}`")
+        if remote.get("proposalTier") is not None:
+            header.append(f"{tier_label} • {audience}")
+        header.append(f"Tiers 1–{num_tiers} (1 = most balanced)")
+
+        lines = [" • ".join(header), "", f"**Status:** {_status_label(status)}"]
+
+        # Countdown / close time for whichever stage is live.
         if status == "stage1_open":
-            lines.append(f"**Stage 1 closes in:** {format_duration(stage1_left)}")
+            ends_at = _coerce_epoch_seconds(remote.get("closesAt")) or float(stage["ends_at"])
+            left = max(0, int(ends_at - now))
+            lines.append(
+                f"**Stage 1 closes:** <t:{int(ends_at)}:R> ({format_duration(left)} left)"
+                if left > 0
+                else "**Stage 1 window has ended** — awaiting result computation."
+            )
+        elif status == "preference_open":
+            pref_at = _coerce_epoch_seconds(remote.get("preferenceClosesAt")) or stage.get(
+                "preference_ends_at"
+            )
+            if pref_at:
+                left = max(0, int(float(pref_at) - now))
+                lines.append(
+                    f"**Stage 2 closes:** <t:{int(float(pref_at))}:R> ({format_duration(left)} left)"
+                )
+        elif remote.get("pollClosedAt"):
+            closed_at = _coerce_epoch_seconds(remote.get("pollClosedAt"))
+            if closed_at:
+                lines.append(f"**Closed:** <t:{int(closed_at)}:f>")
 
-        lines.append("")
-        lines.append("**Voting is done via the Interspace web UI.**")
+        if not remote:
+            lines.append("")
+            lines.append("⚠️ Could not reach Interspace — live vote data unavailable.")
+
+        # Participation against the 65% quorum that close-time enforces.
+        eligible = int(remote.get("eligibleActive") or 0)
+        locked = int(remote.get("totalLockedVoters") or 0)
+        quorum_needed = int(remote.get("quorumNeeded") or 0)
+        quorum_pct = float(remote.get("quorumThresholdPct") or QUORUM_PERCENT) * 100.0
+        participation = remote.get("participationPct")
+        if eligible or locked:
+            met = "✅ quorum met" if locked >= quorum_needed else "❌ quorum not met"
+            share = (locked / eligible) if eligible else 0.0
+            pct_text = f"{participation}%" if participation is not None else f"{share * 100:.1f}%"
+            lines.append("")
+            lines.append(f"**Participation — {quorum_pct:.0f}% quorum**")
+            lines.append(
+                f"`{_bar(share)}` {locked}/{eligible} active eligible voters locked "
+                f"({pct_text}) — needs {quorum_needed} — {met}"
+            )
+            abstains = int(remote.get("abstainCount") or 0)
+            if abstains:
+                lines.append(f"Abstained: **{abstains}** (excluded from the denominator)")
+
+        outcome = remote.get("outcome")
+        if outcome and status not in _OPEN_STATUSES:
+            lines.append("")
+            lines.append(f"**Outcome:** {outcome}")
+
         if INTERSPACE_URL:
-            lines.append(f"🔗 {INTERSPACE_URL}")
+            lines.append("")
+            lines.append(
+                f"🌐 Voting happens on Interspace: {INTERSPACE_URL}"
+                if status in _OPEN_STATUSES
+                else f"🌐 Full histogram on Interspace: {INTERSPACE_URL}"
+            )
 
-        return discord.Embed(
-            title=f"Stage Poll Status: {stage['title']} (ID {poll_id})",
+        color = 0x345995
+        if status.startswith("passed"):
+            color = 0x2E9E5B
+        elif status.startswith("failed") or status == "annulled":
+            color = 0x8B0000
+
+        embed = discord.Embed(
+            title=f"⚖️ {title}",
             description="\n".join(lines),
-            color=0x345995,
+            color=color,
             timestamp=discord.utils.utcnow(),
         )
+
+        # Per-option breakdown: tier histogram, expected tier, Simpson cutoff.
+        tier_counts = remote.get("tierCounts")
+        expected = remote.get("expectedAssignments") or []
+        if isinstance(tier_counts, list) and tier_counts:
+            # Discord allows 25 fields; leave room for the Stage 2 field.
+            shown = min(len(tier_counts), len(options), 20)
+            for i, opt in enumerate(options[:shown]):
+                counts = [int(c) for c in tier_counts[i]] if i < len(tier_counts) else []
+                total = sum(counts)
+                exp_tier = expected[i] if i < len(expected) else None
+                exp_text = f"expected **T{exp_tier}**" if exp_tier else "no tier yet"
+
+                if total == 0:
+                    body = "*No locked votes yet.*"
+                else:
+                    rows = [
+                        f"`T{t + 1}` `{_bar(counts[t] / total)}` {counts[t]} ({counts[t] / total * 100:.0f}%)"
+                        for t in range(len(counts))
+                    ]
+                    n_eff = compute_n_eff(counts)
+                    cutoff = compute_pwin(n_eff) * 100.0
+                    leading = max(counts) / total * 100.0
+                    rows.append(
+                        f"Leading share **{leading:.1f}%** vs Simpson cutoff **{cutoff:.1f}%** "
+                        f"{'✅' if leading >= cutoff else '❌ EV fallback'} (n_eff {n_eff:.2f})"
+                    )
+                    if quorum_needed:
+                        rows.append(
+                            f"Tiered by {total}/{eligible} voters — needs {quorum_needed} "
+                            f"{'✅' if total >= quorum_needed else '❌'}"
+                        )
+                    body = "\n".join(rows)
+
+                embed.add_field(name=f"{i + 1}. {opt} — {exp_text}"[:256], value=body, inline=False)
+
+            if len(options) > shown:
+                embed.add_field(
+                    name=f"… and {len(options) - shown} more option(s)",
+                    value=f"See the full breakdown on Interspace: {INTERSPACE_URL or 'the web UI'}",
+                    inline=False,
+                )
+
+        # Stage 2 preference tallies, when that stage exists.
+        pref_counts = remote.get("prefCounts") or []
+        if pref_counts:
+            pref_total = sum(int(item.get("count") or 0) for item in pref_counts)
+            pref_lines = []
+            for item in pref_counts:
+                cnt = int(item.get("count") or 0)
+                share = (cnt / pref_total) if pref_total else 0.0
+                pref_lines.append(
+                    f"`{_bar(share)}` **{item.get('option', '?')}** — {cnt} ({share * 100:.0f}%)"
+                )
+            pref_pct = remote.get("prefParticipationPct")
+            if pref_pct is not None:
+                pref_lines.append(f"Participation: {pref_pct}% of active eligible voters")
+            embed.add_field(
+                name="Stage 2 — preference votes", value="\n".join(pref_lines), inline=False,
+            )
+
+        embed.set_footer(text=f"Poll {poll_id} • status {status}")
+        return embed
 
     async def _refresh_live_status_messages(self, guild_id: int, kind: str, poll_id: int) -> None:
         rows = await db.get_live_poll_statuses(guild_id, kind, poll_id)
@@ -563,6 +746,7 @@ class PollCog(commands.Cog):
             num_tiers=num_tiers,
             duration_seconds=dur_sec,
             preference_duration_seconds=pref_dur_sec,
+            proposal_id=proposal_id,
         )
 
         # Register poll on Interspace so the web UI knows about it.
@@ -872,75 +1056,116 @@ class PollCog(commands.Cog):
                 print(f"[poll] could not post Stage 2 results for {stage_id}: {exc!r}")
         return True
 
-    @poll_group.command(name="status", description="View current results/status for a poll ID.")
+    async def _post_or_update_live_status(
+        self,
+        ctx: discord.ApplicationContext,
+        kind: str,
+        poll_id: int,
+        embed: discord.Embed,
+    ) -> None:
+        """Send or re-edit this channel's persistent status message for a poll."""
+        displays = await db.get_live_poll_statuses(ctx.guild.id, kind, poll_id)
+        existing = next((d for d in displays if d[1] == ctx.channel.id), None)
+        if existing:
+            row_id, _, msg_id = existing
+            try:
+                msg = await ctx.channel.fetch_message(msg_id)
+                await msg.edit(embed=embed)
+                return
+            except discord.NotFound:
+                await db.delete_live_poll_status_row(row_id)
+        msg = await ctx.channel.send(embed=embed)
+        await db.upsert_live_poll_status(ctx.guild.id, kind, poll_id, ctx.channel.id, msg.id)
+
+    async def _resolve_stage_poll(
+        self, guild_id: int, identifier: str,
+    ) -> tuple[dict | None, dict | None]:
+        """Resolve a poll ID or proposal ID to (local stage poll, Interspace snapshot)."""
+        identifier = identifier.strip()
+        stage = None
+        if identifier.isdigit():
+            stage = await db.get_stage_poll_by_id(int(identifier))
+            if stage and int(stage["guild_id"]) != guild_id:
+                stage = None
+        else:
+            stage = await db.get_stage_poll_by_proposal_id(guild_id, identifier)
+
+        # Reject anything that can't safely go in a URL path before asking
+        # Interspace to resolve it for us.
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", identifier):
+            return stage, None
+
+        lookup = identifier if stage is None else f"stage-{int(stage['id'])}"
+        remote = await _interspace_get(f"/api/polls/{lookup}/bot-status")
+
+        if stage is None and remote and remote.get("botPollId") is not None:
+            stage = await db.get_stage_poll_by_id(int(remote["botPollId"]))
+            if stage and int(stage["guild_id"]) != guild_id:
+                stage = None
+
+        # Backfill the proposal id locally so future lookups skip the round-trip.
+        if stage is not None and remote and remote.get("proposalShortId") and not stage.get("proposal_id"):
+            await db.sync_stage_poll_from_interspace(
+                int(stage["id"]), proposal_id=str(remote["proposalShortId"]),
+            )
+        return stage, remote
+
+    @poll_group.command(
+        name="status",
+        description="Full status for a poll: options, live tiers, cutoffs, quorum.",
+    )
     async def poll_status(
         self,
         ctx: discord.ApplicationContext,
-        poll_id: Option(int, "Poll ID", required=True),
+        poll: Option(str, "Poll ID (e.g. 49) or Proposal ID (e.g. PROP-A4F2)", required=True),
         live: Option(bool, "Post/update a persistent in-channel status message", required=False, default=False),
     ) -> None:
         if not ctx.guild:
             await ctx.respond("Must be used in a server.", ephemeral=True)
             return
 
-        # Building the status embed can do multiple DB reads + (in live mode)
-        # a channel fetch_message + edit/send. Defer to keep the interaction
-        # token alive past the 3 s mark.
+        # Building the status embed can do multiple DB reads, an Interspace
+        # round-trip, and (in live mode) a channel fetch_message + edit/send.
+        # Defer to keep the interaction token alive past the 3 s mark.
         await ctx.defer(ephemeral=True)
 
-        poll = await db.get_poll_by_id(poll_id)
-        if poll and poll["guild_id"] == ctx.guild.id:
-            embed = await self._build_regular_status_embed(ctx.guild, poll)
-            if live:
-                if not isinstance(ctx.channel, discord.TextChannel):
-                    await ctx.respond("Use live status in a server text channel.", ephemeral=True)
-                    return
-                displays = await db.get_live_poll_statuses(ctx.guild.id, "regular", poll_id)
-                existing = next((d for d in displays if d[1] == ctx.channel.id), None)
-                if existing:
-                    row_id, _, msg_id = existing
-                    try:
-                        msg = await ctx.channel.fetch_message(msg_id)
-                        await msg.edit(embed=embed)
-                    except discord.NotFound:
-                        await db.delete_live_poll_status_row(row_id)
-                        msg = await ctx.channel.send(embed=embed)
-                        await db.upsert_live_poll_status(ctx.guild.id, "regular", poll_id, ctx.channel.id, msg.id)
-                else:
-                    msg = await ctx.channel.send(embed=embed)
-                    await db.upsert_live_poll_status(ctx.guild.id, "regular", poll_id, ctx.channel.id, msg.id)
-                await ctx.respond("Live poll status posted.", ephemeral=True)
-            else:
-                await ctx.respond(embed=embed, ephemeral=True)
-            return
+        identifier = poll.strip()
 
-        stage = await db.get_stage_poll_by_id(poll_id)
-        if stage and stage["guild_id"] == ctx.guild.id:
-            embed = await self._build_stage_status_embed(stage)
+        # Reaction polls keep precedence on numeric IDs (they use a separate id
+        # sequence from stage polls) and never need an Interspace round-trip.
+        if identifier.isdigit():
+            regular = await db.get_poll_by_id(int(identifier))
+            if regular and regular["guild_id"] == ctx.guild.id:
+                embed = await self._build_regular_status_embed(ctx.guild, regular)
+                if live:
+                    if not isinstance(ctx.channel, discord.TextChannel):
+                        await ctx.respond("Use live status in a server text channel.", ephemeral=True)
+                        return
+                    await self._post_or_update_live_status(ctx, "regular", int(identifier), embed)
+                    await ctx.respond("Live poll status posted.", ephemeral=True)
+                else:
+                    await ctx.respond(embed=embed, ephemeral=True)
+                return
+
+        stage, remote = await self._resolve_stage_poll(ctx.guild.id, identifier)
+        if stage is not None:
+            poll_id = int(stage["id"])
+            embed = await self._build_stage_status_embed(stage, remote=remote)
             if live:
                 if not isinstance(ctx.channel, discord.TextChannel):
                     await ctx.respond("Use live status in a server text channel.", ephemeral=True)
                     return
-                displays = await db.get_live_poll_statuses(ctx.guild.id, "stage", poll_id)
-                existing = next((d for d in displays if d[1] == ctx.channel.id), None)
-                if existing:
-                    row_id, _, msg_id = existing
-                    try:
-                        msg = await ctx.channel.fetch_message(msg_id)
-                        await msg.edit(embed=embed)
-                    except discord.NotFound:
-                        await db.delete_live_poll_status_row(row_id)
-                        msg = await ctx.channel.send(embed=embed)
-                        await db.upsert_live_poll_status(ctx.guild.id, "stage", poll_id, ctx.channel.id, msg.id)
-                else:
-                    msg = await ctx.channel.send(embed=embed)
-                    await db.upsert_live_poll_status(ctx.guild.id, "stage", poll_id, ctx.channel.id, msg.id)
+                await self._post_or_update_live_status(ctx, "stage", poll_id, embed)
                 await ctx.respond("Live stage poll status posted.", ephemeral=True)
             else:
                 await ctx.respond(embed=embed, ephemeral=True)
             return
 
-        await ctx.respond(f"No poll with ID **{poll_id}** in this server.", ephemeral=True)
+        await ctx.respond(
+            f"No poll found for **{identifier}**. Use a poll ID (e.g. `49`) or the "
+            "proposal ID the poll was opened for (e.g. `PROP-A4F2`).",
+            ephemeral=True,
+        )
 
     @poll_group.command(name="delete", description="Remove a poll (Mod/Admin).")
     async def poll_delete(
@@ -1139,6 +1364,7 @@ class PollCog(commands.Cog):
                     options=remote_options if isinstance(remote_options, list) else None,
                     num_tiers=int(remote["numTiers"]) if remote.get("numTiers") is not None else None,
                     preference_options=pref_opts_arg,
+                    proposal_id=remote.get("proposalShortId"),
                 )
 
                 local_status = str(poll.get("status") or "")
