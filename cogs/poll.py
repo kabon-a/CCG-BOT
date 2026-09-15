@@ -1107,6 +1107,82 @@ class PollCog(commands.Cog):
                 return None
         return channel if isinstance(channel, discord.TextChannel) else None
 
+    async def _sync_stage_polls_from_interspace(self) -> None:
+        """Mirror Interspace schedule/status onto local stage polls and close when remote already finalized."""
+        if not INTERSPACE_URL or not INTERSPACE_BOT_SECRET:
+            return
+
+        for poll in await db.get_stage_polls_needing_interspace_sync():
+            poll_id = int(poll["id"])
+            try:
+                remote = await _interspace_get(f"/api/polls/stage-{poll_id}/bot-status")
+                if remote is None:
+                    continue
+
+                remote_status = str(remote.get("status") or "")
+                closes_at = _coerce_epoch_seconds(remote.get("closesAt"))
+                pref_closes_at = _coerce_epoch_seconds(remote.get("preferenceClosesAt"))
+                remote_options = remote.get("options")
+                remote_pref_opts = remote.get("preferenceOptions")
+                pref_opts_arg = ...
+                if isinstance(remote_pref_opts, list):
+                    pref_opts_arg = [
+                        int(x) for x in remote_pref_opts
+                        if isinstance(x, (int, float, str)) and str(x).lstrip("-").isdigit()
+                    ]
+
+                await db.sync_stage_poll_from_interspace(
+                    poll_id,
+                    ends_at=closes_at,
+                    preference_ends_at=pref_closes_at if pref_closes_at is not None else ...,
+                    title=remote.get("title"),
+                    options=remote_options if isinstance(remote_options, list) else None,
+                    num_tiers=int(remote["numTiers"]) if remote.get("numTiers") is not None else None,
+                    preference_options=pref_opts_arg,
+                )
+
+                local_status = str(poll.get("status") or "")
+                guild = self.bot.get_guild(int(poll["guild_id"]))
+                channel = (
+                    await self._resolve_text_channel(guild, int(poll["channel_id"]))
+                    if guild
+                    else None
+                )
+
+                # Interspace already left Stage 1 — pull results + announce even if local timer remains.
+                if local_status in ("stage1_open", "failed_stage1") and remote_status and remote_status != "stage1_open":
+                    await db.clear_stage_poll_retry(poll_id)
+                    if local_status == "failed_stage1":
+                        await db.set_stage_poll_status(poll_id, "stage1_open")
+                    refreshed = await db.get_stage_poll_by_id(poll_id) or poll
+                    if guild:
+                        await self._close_stage1_and_post(guild, refreshed, channel)
+                        await self._refresh_live_status_messages(int(poll["guild_id"]), "stage", poll_id)
+                    continue
+
+                # Interspace already left Stage 2 preference.
+                if local_status in ("preference_open", "failed_preference") and remote_status not in (
+                    "",
+                    "preference_open",
+                    "stage1_open",
+                ):
+                    await db.clear_stage_poll_retry(poll_id)
+                    if local_status == "failed_preference":
+                        await db.set_stage_poll_status(
+                            poll_id,
+                            "preference_open",
+                            preference_options=json.loads(poll["preference_options"])
+                            if poll.get("preference_options")
+                            else None,
+                            preference_ends_at=pref_closes_at or poll.get("preference_ends_at"),
+                        )
+                    refreshed = await db.get_stage_poll_by_id(poll_id) or poll
+                    if guild:
+                        await self._close_preference_and_post(guild, refreshed, channel)
+                        await self._refresh_live_status_messages(int(poll["guild_id"]), "stage", poll_id)
+            except Exception as exc:
+                print(f"[poll] Interspace sync failed for stage poll {poll_id}: {exc!r}")
+
     @tasks.loop(seconds=30)
     async def check_poll_closures(self) -> None:
         # CRITICAL: every poll is processed in its own try/except, and the whole
@@ -1116,6 +1192,10 @@ class PollCog(commands.Cog):
         # Interspace error (or a single bad row) silently disables automatic
         # closure for EVERY poll until the bot is restarted.
         try:
+            # Pull Interspace status/close times first so abrupt admin closes
+            # and remote deadline changes are mirrored before local expiry work.
+            await self._sync_stage_polls_from_interspace()
+
             for poll in await db.get_pending_polls():
                 try:
                     if str(poll.get("title", "")).startswith("[Stage 2] "):

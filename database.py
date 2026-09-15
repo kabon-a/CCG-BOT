@@ -1814,6 +1814,67 @@ async def get_pending_preference_polls() -> list[dict]:
         return [dict(r) for r in await cur.fetchall()]
 
 
+async def get_stage_polls_needing_interspace_sync() -> list[dict]:
+    """Local stage polls that may still need Interspace state mirrored."""
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            """
+            SELECT * FROM stage_polls
+            WHERE status IN (
+                'stage1_open', 'preference_open',
+                'failed_stage1', 'failed_preference'
+            )
+            ORDER BY id ASC
+            """
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def sync_stage_poll_from_interspace(
+    poll_id: int,
+    *,
+    ends_at: float | None = None,
+    preference_ends_at: float | None = ...,  # type: ignore[assignment]
+    title: str | None = None,
+    options: list[str] | None = None,
+    num_tiers: int | None = None,
+    preference_options: list[int] | None = ...,  # type: ignore[assignment]
+) -> None:
+    """Mirror Interspace schedule / metadata onto the local stage poll row."""
+    sets: list[str] = []
+    vals: list = []
+    if ends_at is not None:
+        sets.append("ends_at = ?")
+        vals.append(float(ends_at))
+    if preference_ends_at is not ...:
+        sets.append("preference_ends_at = ?")
+        vals.append(preference_ends_at)
+    if title is not None and str(title).strip():
+        sets.append("title = ?")
+        vals.append(str(title).strip())
+    if options is not None:
+        sets.append("options = ?")
+        vals.append(json.dumps(list(options)))
+    if num_tiers is not None:
+        sets.append("num_tiers = ?")
+        vals.append(int(num_tiers))
+    if preference_options is not ...:
+        sets.append("preference_options = ?")
+        vals.append(
+            None if preference_options is None else json.dumps(list(preference_options))
+        )
+    if not sets:
+        return
+    vals.append(poll_id)
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        await conn.execute(
+            f"UPDATE stage_polls SET {', '.join(sets)} WHERE id = ?",
+            vals,
+        )
+        await conn.commit()
+
+
 async def get_stage2_poll_for_stage(guild_id: int, stage_poll_id: int) -> dict | None:
     """Get the reaction poll row used for Stage 2 preference, if present."""
     suffix = f"(from stage poll #{stage_poll_id})"
