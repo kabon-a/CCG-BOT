@@ -1,5 +1,6 @@
 """Leaderboard cog - ELO ranking for members + archetype tier list."""
 
+import json
 import logging
 from typing import Any
 
@@ -69,6 +70,13 @@ def _parse_leaderboard_name_from_autocomplete(leaderboard: str) -> str:
     return s
 
 
+async def archived_leaderboard_autocomplete(ctx: discord.AutocompleteContext) -> list[str]:
+    """Board names with at least one archived ending (may since have been deleted)."""
+    if not ctx.interaction.guild_id:
+        return []
+    return await db.list_archived_leaderboard_names(ctx.interaction.guild_id)
+
+
 def _mod_perms(author: discord.Member | discord.User | None) -> bool:
     if not author or not isinstance(author, discord.Member):
         return False
@@ -111,7 +119,77 @@ class LeaderboardCog(commands.Cog):
             embed.set_thumbnail(url=settings.icon_url)
         if settings.banner_url:
             embed.set_image(url=settings.banner_url)
-        embed.set_footer(text="Live • Updates when matches, roster, or settings change")
+        if settings.locked:
+            embed.set_footer(text="🔒 Locked — no new matches count toward these standings")
+        else:
+            embed.set_footer(text="Live • Updates when matches, roster, or settings change")
+        return embed
+
+    def _build_final_standings_embed(self, archive: dict) -> discord.Embed:
+        """Render an archived ending. Uses the settings captured at end time."""
+        try:
+            settings = EloSettings.from_dict(json.loads(archive.get("elo_settings") or "{}"))
+        except (TypeError, ValueError):
+            settings = EloSettings()
+
+        standings = archive.get("standings") or []
+        ranked = [e for e in standings if e.get("ranked")]
+        unranked = [e for e in standings if not e.get("ranked")]
+
+        name = archive.get("leaderboard_name") or "Leaderboard"
+        title = settings.display_title or name
+        lines = []
+        for i, e in enumerate(ranked[:25], 1):
+            medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"`{i}.`")
+            who = e.get("display_name") or f"<@{e.get('user_id')}>"
+            games = int(e.get("match_count") or 0)
+            lines.append(
+                f"{medal} **{who}** — {format_elo(float(e.get('elo') or 0), settings.precision)} ELO "
+                f"({games} match{'es' if games != 1 else ''})"
+            )
+        if len(ranked) > 25:
+            lines.append(f"*…and {len(ranked) - 25} more ranked player(s).*")
+        body = "\n".join(lines) if lines else "*No players qualified for the final standings.*"
+
+        note = archive.get("note")
+        desc = f"*{note}*\n\n{body}" if note else body
+        color = settings.primary_color if settings.primary_color is not None else 0xFFD700
+        embed = discord.Embed(title=f"🏁 Final Standings — {title}", description=desc, color=color)
+
+        if ranked:
+            champion = ranked[0]
+            who = champion.get("display_name") or f"<@{champion.get('user_id')}>"
+            embed.add_field(name="Champion", value=f"👑 **{who}**", inline=True)
+        embed.add_field(
+            name="Players", value=f"{len(ranked)} ranked / {len(standings)} total", inline=True,
+        )
+        embed.add_field(name="Format", value=archive.get("match_format") or "1v1", inline=True)
+
+        ended_at = archive.get("ended_at")
+        closed = f"<t:{int(float(ended_at))}:F>" if ended_at else "unknown"
+        by = archive.get("ended_by")
+        embed.add_field(
+            name="Ended",
+            value=closed + (f" by <@{int(by)}>" if by else ""),
+            inline=False,
+        )
+        if unranked:
+            embed.add_field(
+                name=f"Did not qualify ({len(unranked)})",
+                value=(
+                    f"Below the {settings.matches_required_for_ranking}-match minimum "
+                    "or inactive at close."
+                    if settings.matches_required_for_ranking
+                    else "Inactive at close."
+                ),
+                inline=False,
+            )
+
+        if settings.icon_url:
+            embed.set_thumbnail(url=settings.icon_url)
+        if settings.banner_url:
+            embed.set_image(url=settings.banner_url)
+        embed.set_footer(text=f"Archive #{archive.get('id')} • /leaderboard final to view again")
         return embed
 
     async def _build_tierlist_embed(self, guild_id: int) -> discord.Embed:
@@ -1273,6 +1351,156 @@ class LeaderboardCog(commands.Cog):
             await self.refresh_rankings_displays(guild_id, lb_id)
         else:
             await ctx.respond(f"You are not on **{leaderboard}**.", ephemeral=True)
+
+    @leaderboard_group.command(
+        name="end",
+        description="End a leaderboard: archive final standings and lock it (Mod/Admin only)",
+    )
+    async def end_board(
+        self,
+        ctx: discord.ApplicationContext,
+        leaderboard: Option(str, "Leaderboard to end", required=True, autocomplete=leaderboard_autocomplete),
+        note: Option(str, "Season name or closing note shown with the standings", required=False, default=None),
+        channel: Option(
+            discord.TextChannel, "Where to post the final standings (default: here)",
+            required=False, default=None,
+        ),
+        reset: Option(
+            bool, "Also reset ELOs to default after archiving (default: no)",
+            required=False, default=False,
+        ),
+    ) -> None:
+        if not ctx.author or not ctx.guild:
+            await ctx.respond("Must be used in a server.", ephemeral=True)
+            return
+        if not _mod_perms(ctx.author):
+            await ctx.respond("You need Moderator or Administrator role.", ephemeral=True)
+            return
+
+        target = channel or ctx.channel
+        if not isinstance(target, discord.TextChannel):
+            await ctx.respond("Pick a server text channel for the final standings.", ephemeral=True)
+            return
+
+        # Archiving, locking, refreshing live embeds, and posting the standings
+        # is well past the 3 s initial-response window.
+        await ctx.defer(ephemeral=True)
+
+        name = _parse_leaderboard_name_from_autocomplete(leaderboard)
+        lb_id = await db.get_leaderboard_id(ctx.guild.id, name)
+        if not lb_id:
+            await ctx.respond(f"No leaderboard named **{name}**.", ephemeral=True)
+            return
+
+        was_locked = (await db.get_leaderboard_settings(lb_id)).locked
+        archive = await db.archive_leaderboard(
+            ctx.guild.id, lb_id, note=note, ended_by=ctx.author.id,
+        )
+        if not archive:
+            await ctx.respond(f"Could not archive **{name}**.", ephemeral=True)
+            return
+
+        await _patch_leaderboard_settings(ctx.guild.id, leaderboard, {"locked": True}, undo_ctx=ctx)
+        if reset:
+            await db.reset_leaderboard(ctx.guild.id, name)
+        await self.refresh_rankings_displays(ctx.guild.id, lb_id)
+
+        embed = self._build_final_standings_embed(archive)
+        try:
+            await target.send(embed=embed)
+            posted = f" Final standings posted in {target.mention}."
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning("could not post final standings for %s: %r", name, exc)
+            posted = f" Could not post in {target.mention} — view it with `/leaderboard final`."
+
+        extras = []
+        if was_locked:
+            extras.append("it was already locked")
+        if reset:
+            extras.append("ELOs were reset to default for the next run")
+        suffix = f" ({'; '.join(extras)})" if extras else ""
+        await ctx.respond(
+            f"Ended **{name}** — standings archived as **#{archive['id']}** and the board is "
+            f"now locked to new matches{suffix}.{posted}",
+            ephemeral=True,
+        )
+
+    @leaderboard_group.command(
+        name="final", description="View archived final standings for an ended leaderboard",
+    )
+    async def final_standings(
+        self,
+        ctx: discord.ApplicationContext,
+        leaderboard: Option(
+            str, "Ended leaderboard", required=True, autocomplete=archived_leaderboard_autocomplete,
+        ),
+        archive_id: Option(
+            int, "Specific archive number (default: the most recent ending)",
+            required=False, default=None,
+        ),
+    ) -> None:
+        if not ctx.guild:
+            await ctx.respond("Must be used in a server.", ephemeral=True)
+            return
+        name = _parse_leaderboard_name_from_autocomplete(leaderboard)
+        if archive_id is not None:
+            archive = await db.get_leaderboard_archive(ctx.guild.id, archive_id)
+            if archive and name and archive["leaderboard_name"].lower() != name.lower():
+                archive = None
+        else:
+            archive = await db.get_latest_leaderboard_archive(ctx.guild.id, name)
+        if not archive:
+            await ctx.respond(
+                f"No archived standings found for **{name}**. "
+                "`/leaderboard archives` lists every ending.",
+                ephemeral=True,
+            )
+            return
+        await ctx.respond(embed=self._build_final_standings_embed(archive))
+
+    @leaderboard_group.command(
+        name="archives", description="List archived leaderboard endings",
+    )
+    async def list_archives(
+        self,
+        ctx: discord.ApplicationContext,
+        leaderboard: Option(
+            str, "Only this leaderboard (default: all)", required=False, default=None,
+            autocomplete=archived_leaderboard_autocomplete,
+        ),
+    ) -> None:
+        if not ctx.guild:
+            await ctx.respond("Must be used in a server.", ephemeral=True)
+            return
+        name = _parse_leaderboard_name_from_autocomplete(leaderboard) if leaderboard else None
+        archives = await db.list_leaderboard_archives(ctx.guild.id, name)
+        if not archives:
+            scope = f" for **{name}**" if name else ""
+            await ctx.respond(
+                f"No archived endings{scope} yet. `/leaderboard end` creates one.",
+                ephemeral=True,
+            )
+            return
+
+        lines = []
+        for a in archives:
+            ranked = sum(1 for e in (a.get("standings") or []) if e.get("ranked"))
+            champ = next((e for e in (a.get("standings") or []) if e.get("ranked")), None)
+            who = (champ.get("display_name") or f"<@{champ['user_id']}>") if champ else "no winner"
+            when = f"<t:{int(float(a['ended_at']))}:d>" if a.get("ended_at") else "?"
+            note = f" — *{a['note']}*" if a.get("note") else ""
+            lines.append(
+                f"**#{a['id']}** · {a['leaderboard_name']} · {when} · 👑 {who} "
+                f"· {ranked} ranked{note}"
+            )
+
+        embed = discord.Embed(
+            title="🗄️ Archived Leaderboard Endings",
+            description="\n".join(lines),
+            color=0x8E7CC3,
+        )
+        embed.set_footer(text="View one with /leaderboard final <leaderboard> [archive number]")
+        await ctx.respond(embed=embed, ephemeral=True)
 
     @leaderboard_group.command(name="reset", description="Reset all ELOs on a leaderboard (Mod/Admin only)")
     async def reset_leaderboard_cmd(

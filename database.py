@@ -270,6 +270,31 @@ async def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_leaderboards_guild ON leaderboards(guild_id)
         """)
 
+        # Final standings captured by /leaderboard end. Intentionally has no
+        # foreign key to leaderboards: an archive has to outlive both a reset
+        # and a full /leaderboard delete, so it stores the board's name and
+        # settings inline.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS leaderboard_archives (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                leaderboard_id INTEGER NOT NULL,
+                leaderboard_name TEXT NOT NULL,
+                match_format TEXT NOT NULL DEFAULT '1v1',
+                note TEXT,
+                ended_by INTEGER,
+                ended_at REAL NOT NULL,
+                standings TEXT NOT NULL,
+                elo_settings TEXT NOT NULL DEFAULT '{}'
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_lb_archives_guild ON leaderboard_archives(guild_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_lb_archives_name ON leaderboard_archives(guild_id, leaderboard_name)"
+        )
+
         # Live-updating leaderboard / tier list messages (channel embeds the bot edits)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS live_leaderboard_messages (
@@ -1282,6 +1307,157 @@ async def delete_leaderboard(guild_id: int, name: str) -> bool:
         await db.execute("DELETE FROM leaderboards WHERE id = ?", (lb_id,))
         await db.commit()
     return True
+
+
+# --- Final standings archives (/leaderboard end) ---
+
+
+async def archive_leaderboard(
+    guild_id: int,
+    leaderboard_id: int,
+    *,
+    note: str | None = None,
+    ended_by: int | None = None,
+) -> dict[str, Any] | None:
+    """Snapshot a leaderboard's standings so they survive a reset or delete.
+
+    Every member entry is stored, not just the ones currently displayed, each
+    with the ``ranked`` flag it had at end time (per the board's minimum-match
+    and inactivity filters). That way a later settings change can't silently
+    rewrite who placed where.
+    """
+    meta = await get_leaderboard_by_id(leaderboard_id)
+    if not meta or int(meta["guild_id"]) != guild_id:
+        return None
+    settings = await get_leaderboard_settings(leaderboard_id)
+    settings_json = await get_leaderboard_elo_settings_raw(leaderboard_id) or "{}"
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT user_id, display_name, elo, match_count, last_match_at
+            FROM member_entries WHERE leaderboard_id = ?
+            """,
+            (leaderboard_id,),
+        )
+        rows = await cur.fetchall()
+
+    now = time.time()
+    min_m = settings.matches_required_for_ranking
+    inactive_d = settings.inactive_days_threshold
+    standings: list[dict[str, Any]] = []
+    for r in rows:
+        mc = int(r["match_count"] or 0)
+        lm = r["last_match_at"]
+        ranked = True
+        if min_m > 0 and mc < min_m:
+            ranked = False
+        if inactive_d > 0 and lm is not None and (now - float(lm)) > inactive_d * 86400:
+            ranked = False
+        standings.append({
+            "user_id": int(r["user_id"]),
+            "display_name": r["display_name"],
+            "elo": float(r["elo"]),
+            "match_count": mc,
+            "last_match_at": float(lm) if lm is not None else None,
+            "ranked": ranked,
+        })
+    standings.sort(key=lambda e: -e["elo"])
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cur = await db.execute(
+            """
+            INSERT INTO leaderboard_archives (
+                guild_id, leaderboard_id, leaderboard_name, match_format,
+                note, ended_by, ended_at, standings, elo_settings
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                guild_id,
+                leaderboard_id,
+                meta["name"],
+                meta.get("match_format") or "1v1",
+                (note or "").strip() or None,
+                ended_by,
+                now,
+                json.dumps(standings),
+                settings_json,
+            ),
+        )
+        await db.commit()
+        archive_id = cur.lastrowid
+
+    return {
+        "id": archive_id,
+        "guild_id": guild_id,
+        "leaderboard_id": leaderboard_id,
+        "leaderboard_name": meta["name"],
+        "match_format": meta.get("match_format") or "1v1",
+        "note": (note or "").strip() or None,
+        "ended_by": ended_by,
+        "ended_at": now,
+        "standings": standings,
+        "elo_settings": settings_json,
+    }
+
+
+def _archive_row_to_dict(row: aiosqlite.Row) -> dict[str, Any]:
+    d = dict(row)
+    try:
+        d["standings"] = json.loads(d.get("standings") or "[]")
+    except (TypeError, ValueError):
+        d["standings"] = []
+    return d
+
+
+async def list_leaderboard_archives(
+    guild_id: int, name: str | None = None, limit: int = 25,
+) -> list[dict[str, Any]]:
+    """Archived endings for a guild, newest first (optionally one board only)."""
+    sql = "SELECT * FROM leaderboard_archives WHERE guild_id = ?"
+    vals: list[Any] = [guild_id]
+    if name and name.strip():
+        sql += " AND LOWER(leaderboard_name) = LOWER(?)"
+        vals.append(name.strip())
+    sql += " ORDER BY ended_at DESC, id DESC LIMIT ?"
+    vals.append(limit)
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(sql, vals)
+        return [_archive_row_to_dict(r) for r in await cur.fetchall()]
+
+
+async def get_leaderboard_archive(guild_id: int, archive_id: int) -> dict[str, Any] | None:
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            "SELECT * FROM leaderboard_archives WHERE guild_id = ? AND id = ?",
+            (guild_id, archive_id),
+        )
+        row = await cur.fetchone()
+        return _archive_row_to_dict(row) if row else None
+
+
+async def get_latest_leaderboard_archive(guild_id: int, name: str) -> dict[str, Any] | None:
+    rows = await list_leaderboard_archives(guild_id, name, limit=1)
+    return rows[0] if rows else None
+
+
+async def list_archived_leaderboard_names(guild_id: int, limit: int = 25) -> list[str]:
+    """Distinct board names that have at least one archived ending."""
+    async with aiosqlite.connect(DATABASE_PATH) as conn:
+        cur = await conn.execute(
+            """
+            SELECT leaderboard_name, MAX(ended_at) AS last_end
+            FROM leaderboard_archives WHERE guild_id = ?
+            GROUP BY LOWER(leaderboard_name)
+            ORDER BY last_end DESC LIMIT ?
+            """,
+            (guild_id, limit),
+        )
+        return [r[0] for r in await cur.fetchall()]
 
 
 # --- Live leaderboard / tier list channel messages ---

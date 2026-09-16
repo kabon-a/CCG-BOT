@@ -51,9 +51,17 @@ A Discord bot for Yu-Gi-Oh! format management: ELO ranking, archetype tier lists
 | `/leaderboard tierlist` | View the archetype/deck tier list (meta strength by win-rate) |
 | `/leaderboard tiers` | Display archetype tier list (same as `tierlist`) |
 | `/leaderboard remove <leaderboard>` | Remove yourself from a leaderboard |
+| `/leaderboard end <leaderboard> [note] [channel] [reset]` | End a leaderboard (Mod/Admin): archive the final standings, post a standings embed with the champion, and lock the board so no new matches count. `note` labels the run (e.g. a season name), `reset` also returns everyone to the default ELO for the next season. |
+| `/leaderboard final <leaderboard> [archive_id]` | View archived final standings. Defaults to the most recent ending. |
+| `/leaderboard archives [leaderboard]` | List archived endings with their archive numbers, dates, and champions. |
 | `/leaderboard reset <name>` | Reset all ELOs on a leaderboard (Mod/Admin) |
 | `/leaderboard reset_tierlist` | Reset archetype tier list (Mod/Admin) |
 | `/leaderboard delete <name>` | Delete a leaderboard (Mod/Admin) |
+
+Archived endings are stored independently of the leaderboard itself, so they
+survive both `/leaderboard reset` and `/leaderboard delete`. Each archive keeps
+every member's ELO and match count, whether they qualified for the ranked
+standings at close, and the display settings in effect at the time.
 
 ### ELO Settings
 
