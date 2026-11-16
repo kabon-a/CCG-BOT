@@ -11,15 +11,15 @@ from typing import Any
 import aiosqlite
 
 from config import DATABASE_PATH
-
-
-def normalize_deck_name(name: str) -> str:
-    """Normalize deck/archetype name to avoid duplicate entries (case, spacing, punctuation)."""
-    s = name.strip().lower()
-    s = unicodedata.normalize("NFKC", s)
-    s = re.sub(r"[-_./]+", " ", s)
-    s = re.sub(r"\s+", " ", s)
-    return s.strip()
+from elo_core import (
+    CONSTITUTION_ELO,
+    DEFAULT_AA,
+    aa_archetype_delta,
+    aa_archetype_draw_deltas,
+    apply_rank_decay,
+    elo_deltas,
+    normalize_deck_name,
+)
 
 
 @dataclass
@@ -553,6 +553,15 @@ async def init_db() -> None:
             )
         except aiosqlite.OperationalError:
             pass
+        try:
+            await db.execute(
+                "ALTER TABLE member_entries ADD COLUMN true_elo REAL"
+            )
+            await db.execute(
+                "UPDATE member_entries SET true_elo = elo WHERE true_elo IS NULL"
+            )
+        except aiosqlite.OperationalError:
+            pass
 
         # Migration: split single `last_activity` into per-source timestamps so
         # courtroom (10d) and confirmed-match (7d) windows can be tracked
@@ -927,7 +936,7 @@ async def get_member_entry_full(leaderboard_id: int, user_id: int) -> dict[str, 
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
             """
-            SELECT id, elo, display_name, match_count, last_match_at
+            SELECT id, elo, true_elo, display_name, match_count, last_match_at
             FROM member_entries WHERE leaderboard_id = ? AND user_id = ?
             """,
             (leaderboard_id, user_id),
@@ -1027,9 +1036,17 @@ async def record_match(
 
     wid, lid = int(wrow["id"]), int(lrow["id"])
     welo_pre, lelo_pre = float(wrow["elo"]), float(lrow["elo"])
-    wdelta, ldelta = elo_change(welo_pre, lelo_pre, settings)
+    wtrue_pre = float(wrow.get("true_elo") if wrow.get("true_elo") is not None else welo_pre)
+    ltrue_pre = float(lrow.get("true_elo") if lrow.get("true_elo") is not None else lelo_pre)
+
+    # Prefer Constitution defaults for the shared CCG ladder; keep stored settings for other boards.
+    elo_settings = CONSTITUTION_ELO
+    wdelta, ldelta = elo_deltas(welo_pre, lelo_pre, 1.0, elo_settings)
+    wtrue_d, ltrue_d = elo_deltas(wtrue_pre, ltrue_pre, 1.0, elo_settings)
     new_welo = welo_pre + wdelta
     new_lelo = lelo_pre + ldelta
+    new_wtrue = wtrue_pre + wtrue_d
+    new_ltrue = ltrue_pre + ltrue_d
 
     winner_canon = normalize_deck_name(winner_deck)
     loser_canon = normalize_deck_name(loser_deck)
@@ -1046,18 +1063,18 @@ async def record_match(
     l_arch_pre, l_ta_pre = l_stats
 
     aa = await get_aa_settings(guild_id)
-    inf = aa.influence_range
     pair_n_before = 0 if mirror else await get_pair_n(guild_id, winner_canon, loser_canon)
 
-    delta_arch = 0.0
-    if not mirror:
-        e_player = aa_elo_expected(new_welo, new_lelo, inf)
-        e_arch = aa_elo_expected(w_arch_pre, l_arch_pre, inf)
-        alpha = 2.0 * abs(e_player - 0.5)
-        e_combined = alpha * e_player + (1.0 - alpha) * e_arch
-        denom = pair_n_before + aa.n0
-        k_eff = aa.k_arch * (pair_n_before / denom) if denom > 0 else 0.0
-        delta_arch = k_eff * (1.0 - e_combined)
+    # AA uses true (non-decayed) player ratings after the match update.
+    delta_arch = aa_archetype_delta(
+        true_winner=new_wtrue,
+        true_loser=new_ltrue,
+        arch_winner=w_arch_pre,
+        arch_loser=l_arch_pre,
+        pair_n_before=pair_n_before,
+        mirror=mirror,
+        settings=aa if aa else DEFAULT_AA,
+    )
 
     now = time.time()
     w_mc, w_lm = int(wrow["match_count"] or 0), wrow["last_match_at"]
@@ -1070,12 +1087,14 @@ async def record_match(
         "winner": {
             "row_id": wid,
             "elo": welo_pre,
+            "true_elo": wtrue_pre,
             "match_count": w_mc,
             "last_match_at": w_lm,
         },
         "loser": {
             "row_id": lid,
             "elo": lelo_pre,
+            "true_elo": ltrue_pre,
             "match_count": l_mc,
             "last_match_at": l_lm,
         },
@@ -1096,15 +1115,38 @@ async def record_match(
             "total_aa_matches": l_ta_pre,
         }
 
+    # Load full ladder so decay can run on every display rating.
     async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute(
-            "UPDATE member_entries SET elo = elo + ?, match_count = match_count + 1, last_match_at = ? WHERE id = ?",
-            (wdelta, now, wid),
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT id, elo, true_elo FROM member_entries WHERE leaderboard_id = ?",
+            (leaderboard_id,),
         )
-        await db.execute(
-            "UPDATE member_entries SET elo = elo + ?, match_count = match_count + 1, last_match_at = ? WHERE id = ?",
-            (ldelta, now, lid),
-        )
+        seats = await cur.fetchall()
+
+    seat_map = {int(r["id"]): float(r["elo"]) for r in seats}
+    seat_map[wid] = new_welo
+    seat_map[lid] = new_lelo
+    decayed = apply_rank_decay([(str(i), e) for i, e in seat_map.items()])
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        for rid, before in seat_map.items():
+            after = decayed.get(str(rid), before)
+            if rid == wid:
+                await db.execute(
+                    "UPDATE member_entries SET elo = ?, true_elo = ?, match_count = match_count + 1, last_match_at = ? WHERE id = ?",
+                    (after, new_wtrue, now, wid),
+                )
+            elif rid == lid:
+                await db.execute(
+                    "UPDATE member_entries SET elo = ?, true_elo = ?, match_count = match_count + 1, last_match_at = ? WHERE id = ?",
+                    (after, new_ltrue, now, lid),
+                )
+            else:
+                await db.execute(
+                    "UPDATE member_entries SET elo = ? WHERE id = ?",
+                    (after, rid),
+                )
         if not mirror:
             await db.execute(
                 "UPDATE archetypes SET elo = elo + ?, total_aa_matches = total_aa_matches + 1 WHERE guild_id = ? AND canonical_name = ?",
@@ -1250,6 +1292,42 @@ async def get_tier_list(guild_id: int, limit: int = 25) -> list[tuple[str, str, 
             (guild_id, min_g, limit),
         )
         return await cur.fetchall()
+
+
+async def set_member_elo_mirror(
+    leaderboard_id: int,
+    user_id: int,
+    elo: float,
+    true_elo: float | None = None,
+) -> None:
+    """Overwrite local display/true Elo from an Interspace sync snapshot."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        if true_elo is None:
+            await db.execute(
+                "UPDATE member_entries SET elo = ? WHERE leaderboard_id = ? AND user_id = ?",
+                (elo, leaderboard_id, user_id),
+            )
+        else:
+            await db.execute(
+                "UPDATE member_entries SET elo = ?, true_elo = ? WHERE leaderboard_id = ? AND user_id = ?",
+                (elo, true_elo, leaderboard_id, user_id),
+            )
+        await db.commit()
+
+
+async def set_archetype_elo_mirror(guild_id: int, display_name: str, elo: float, matches: int) -> None:
+    canon = normalize_deck_name(display_name)
+    await get_or_create_archetype(guild_id, display_name)
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            """
+            UPDATE archetypes
+            SET elo = ?, total_aa_matches = ?
+            WHERE guild_id = ? AND canonical_name = ?
+            """,
+            (elo, matches, guild_id, canon),
+        )
+        await db.commit()
 
 
 async def set_member_display_name(leaderboard_id: int, user_id: int, display_name: str) -> bool:

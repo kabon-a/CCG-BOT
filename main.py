@@ -34,6 +34,8 @@ def main() -> None:
     bot.load_extension("cogs.card_releases")
     # PSCT lint reports from #report-a-problem → Cursor cloud agent → PR
     bot.load_extension("cogs.psct_report")
+    # Pull Interspace-approved rated matches so Discord stays in sync
+    bot.load_extension("cogs.ratings_pull")
     bot.run(BOT_TOKEN)
 
 

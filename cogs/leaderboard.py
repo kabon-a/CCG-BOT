@@ -1158,19 +1158,51 @@ class LeaderboardCog(commands.Cog):
                 )
                 return
 
-            ok = await db.record_match(
-                guild_id,
-                lb_id,
-                winner.id,
-                loser.id,
-                winner_deck,
-                loser_deck,
-                actor_id=ctx.author.id,
+            # Interspace is canonical when linked. Apply once there, then mirror locally
+            # with the duplicated algorithm so Discord embeds stay current.
+            from ratings_sync import interspace_record_match
+
+            remote = await interspace_record_match(
+                {
+                    "externalId": f"discord:{guild_id}:{lb_id}:{winner.id}:{loser.id}:{int(__import__('time').time())}",
+                    "winnerDiscordId": str(winner.id),
+                    "loserDiscordId": str(loser.id),
+                    "winnerDeck": winner_deck,
+                    "loserDeck": loser_deck,
+                }
             )
+            if remote:
+                # Prefer Interspace snapshot values on local rows when Discord IDs map.
+                pa, pb = remote.get("playerA") or {}, remote.get("playerB") or {}
+                for side in (pa, pb):
+                    did = side.get("discordId")
+                    elo = side.get("elo")
+                    true_elo = side.get("trueElo")
+                    if did and elo is not None:
+                        await db.set_member_elo_mirror(lb_id, int(did), float(elo), float(true_elo) if true_elo is not None else None)
+                for arch, key in ((remote.get("archetypeA"), remote.get("deckA")), (remote.get("archetypeB"), remote.get("deckB"))):
+                    if not arch or not key:
+                        continue
+                    name = (key or {}).get("name")
+                    if name and arch.get("elo") is not None:
+                        await db.set_archetype_elo_mirror(guild_id, name, float(arch["elo"]), int(arch.get("matches") or 0))
+                ok = True
+                note = " Synced with Interspace (canonical)."
+            else:
+                ok = await db.record_match(
+                    guild_id,
+                    lb_id,
+                    winner.id,
+                    loser.id,
+                    winner_deck,
+                    loser_deck,
+                    actor_id=ctx.author.id,
+                )
+                note = " (Interspace unavailable — local algorithm only)."
             if ok:
                 await ctx.followup.send(
                     f"Recorded: **{winner.display_name}** ({winner_deck}) defeated **{loser.display_name}** ({loser_deck}) on **{leaderboard}**. "
-                    "Player ELO updated; archetype AA-ELO updated (1v1)."
+                    f"Player ELO + AA-ELO updated (true Elo for AA; decayed Elo for ladder).{note}"
                 )
                 await self.refresh_rankings_displays(guild_id, lb_id)
                 await self.refresh_tierlist_displays(guild_id)
